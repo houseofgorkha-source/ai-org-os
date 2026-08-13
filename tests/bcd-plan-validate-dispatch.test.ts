@@ -298,3 +298,138 @@ test('T-D8 a dependency-satisfied unit is driven through the full post-admission
   assert.equal(st.failures.length, 0, 'no dependency-related or any other failure occurred');
   assert.equal(w.events.byType('workunit.blocked').length, 0, 'never blocked at any point in this run');
 });
+
+// ----------------------------------------- Plan-level status aggregation
+// Note 06 §2.4: approved -> running -> complete/partial. Kernel-owned
+// projection, keyed by plan.id@plan.version; the input TaskPlan is never
+// mutated (asserted implicitly — `plan.status` below is never read again
+// after construction, only `w.kernel.planStatus(...)` is).
+
+test('T-D9 an incomplete plan is neither complete nor partial while a node remains unresolved', () => {
+  const w = makeWorld({ script: FIXING_SCRIPT });
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1, n2], edges: [{ from: 'n1', to: 'n2', kind: 'ordering' }] };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  w.kernel.materialise(plan, n2, w.baseline);
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'approved', 'nothing dispatched yet');
+
+  w.kernel.acquireLease(u1.id, 's1');
+  w.kernel.runAttempt(u1.id, FIXING_SCRIPT);
+  const st1 = w.kernel.expect(u1.id);
+  assert.equal(st1.status, 'awaiting_approval');
+  const art1 = st1.artifacts[st1.artifacts.length - 1]!;
+  w.kernel.recordApproval(approvalFor('merge', art1.id, art1.contentHash));
+  w.kernel.accept(u1.id, art1.id);
+  assert.equal(w.kernel.expect(u1.id).status, 'accepted');
+
+  // n2 is still untouched (never even admitted) — the plan cannot resolve.
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'running');
+});
+
+test('T-D10 a plan with every node accepted reaches complete, with correct event evidence', () => {
+  const w = makeWorld({ script: FIXING_SCRIPT });
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1, n2], edges: [{ from: 'n1', to: 'n2', kind: 'ordering' }] };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  const u2 = w.kernel.materialise(plan, n2, w.baseline);
+
+  const driveToAccepted = (u: typeof u1): void => {
+    w.kernel.acquireLease(u.id, 's1');
+    w.kernel.runAttempt(u.id, FIXING_SCRIPT);
+    const st = w.kernel.expect(u.id);
+    const art = st.artifacts[st.artifacts.length - 1]!;
+    w.kernel.recordApproval(approvalFor('merge', art.id, art.contentHash));
+    w.kernel.accept(u.id, art.id);
+  };
+
+  driveToAccepted(u1);
+  assert.equal(w.kernel.expect(u1.id).status, 'accepted');
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'running', 'still waiting on n2');
+
+  assert.equal(w.kernel.admit(u2.id).admitted, true, 'n1 accepted satisfies the ordering dependency');
+  driveToAccepted(u2);
+  assert.equal(w.kernel.expect(u2.id).status, 'accepted');
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'complete');
+
+  const evs = w.events.byType('plan.complete');
+  assert.equal(evs.length, 1);
+  assert.equal(evs[0]!.correlationId, plan.intentRef, 'plan events correlate to the originating intent, like unit events');
+  assert.equal((evs[0]!.payload as { version: string }).version, plan.version);
+});
+
+test('T-D11 a plan with mixed terminal outcomes reaches partial', () => {
+  // n2 genuinely fails via the existing denial-budget escalation path
+  // (T-F4's mechanism) rather than a direct status assignment, so this test
+  // proves aggregation against a REAL terminal-failure transition too.
+  const spam = (_p: string, t: number): string => (t <= 6 ? 'CALL net.fetch https://x.invalid/a {"path":"a"}' : 'DONE');
+  const w = makeWorld({ script: spam });
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1, n2] }; // independent nodes, no edge needed
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  const u2 = w.kernel.materialise(plan, n2, w.baseline);
+
+  w.kernel.expect(u1.id).status = 'accepted'; // not the focus of this test
+
+  w.kernel.acquireLease(u2.id, 's1');
+  w.kernel.runAttempt(u2.id, spam);
+  assert.equal(w.kernel.expect(u2.id).status, 'escalated');
+
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'partial');
+  assert.ok(w.events.byType('plan.partial').length >= 1);
+});
+
+test('T-D12 blocking propagates transitively through a 3-node chain, and the plan resolves to partial', () => {
+  const w = makeWorld();
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const n3 = { ...node(w.plan), nodeId: 'n3' };
+  const plan: TaskPlan = {
+    ...w.plan, nodes: [n1, n2, n3],
+    edges: [{ from: 'n1', to: 'n2', kind: 'ordering' }, { from: 'n2', to: 'n3', kind: 'ordering' }],
+  };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  const u2 = w.kernel.materialise(plan, n2, w.baseline);
+  const u3 = w.kernel.materialise(plan, n3, w.baseline);
+
+  w.kernel.expect(u1.id).status = 'exhausted'; // terminal, not accepted
+
+  const r2 = w.kernel.admit(u2.id);
+  assert.equal(r2.admitted, false);
+  assert.equal(r2.reason, 'dependency_failed');
+  assert.equal(w.kernel.expect(u2.id).status, 'blocked');
+
+  const r3 = w.kernel.admit(u3.id);
+  assert.equal(r3.admitted, false);
+  assert.equal(r3.reason, 'dependency_failed', 'n2 being blocked now counts as a failed dependency for n3');
+  assert.equal(w.kernel.expect(u3.id).status, 'blocked');
+
+  assert.equal(w.kernel.expect(u2.id).failures.length, 0, 'blocked units consume no FailureRecord');
+  assert.equal(w.kernel.expect(u3.id).failures.length, 0);
+  assert.equal(w.kernel.expect(u2.id).attempts.length, 0, 'blocked units consume no attempt');
+  assert.equal(w.kernel.expect(u3.id).attempts.length, 0);
+
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'partial', 'every node is terminal-or-blocked; none accepted');
+});
+
+test('T-D13 plan-completion events are idempotent under repeated recomputation', () => {
+  const w = makeWorld({ script: FIXING_SCRIPT });
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1] };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  w.kernel.acquireLease(u1.id, 's1');
+  w.kernel.runAttempt(u1.id, FIXING_SCRIPT);
+  const st = w.kernel.expect(u1.id);
+  const art = st.artifacts[st.artifacts.length - 1]!;
+  w.kernel.recordApproval(approvalFor('merge', art.id, art.contentHash));
+
+  assert.equal(w.kernel.accept(u1.id, art.id).accepted, true);
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'complete');
+
+  // Recomputation is triggered again by a second call through the same
+  // existing entry point; the transition must not re-fire.
+  w.kernel.accept(u1.id, art.id);
+  assert.equal(w.events.byType('plan.complete').length, 1, 'a second recomputation does not re-emit the transition');
+});

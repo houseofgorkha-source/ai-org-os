@@ -73,12 +73,19 @@ export interface Faults {
   readonly expireLeaseDuringExecution?: boolean;
 }
 
+interface PlanState {
+  readonly plan: TaskPlan;
+  status: TaskPlan['status'];
+}
+
 export class Kernel {
   private readonly d: KernelDeps;
   readonly units = new Map<string, UnitState>();
   readonly approvals: Approval[] = [];
   readonly account: BudgetAccount;
   private readonly compiler: ContextCompiler;
+  /** Plan-level status projection (Note 06 §2.4), keyed by plan.id@plan.version. Never mutates the input TaskPlan. */
+  private readonly plans = new Map<string, PlanState>();
 
   constructor(deps: KernelDeps) {
     this.d = deps;
@@ -93,6 +100,12 @@ export class Kernel {
     const key = `${plan.id}@${plan.version}#${node.nodeId}`;
     const existing = [...this.units.values()].find((u) => materialKey(u.unit) === key);
     if (existing) return existing.unit;
+
+    // Register the plan projection once, on its first node's materialisation.
+    // The stored `plan` reference is read-only here on; its own status field
+    // is never written back to — only this projection's `status` is.
+    const planKeyStr = `${plan.id}@${plan.version}`;
+    if (!this.plans.has(planKeyStr)) this.plans.set(planKeyStr, { plan, status: plan.status });
 
     const spec = resolveSpec(node, this.d.registry, this.d.policy, this.d.resolver, plan.budgetAggregate.execution);
     const budget: EffectiveBudget = spec.effectiveBudget;
@@ -163,6 +176,7 @@ export class Kernel {
       // attempt_failed here, so this is always a fresh transition into blocked.
       st.status = 'blocked';
       this.emit('workunit.blocked', [unitId], { failedDependency: failedDependency!.unitId, kind: failedDependency!.kind });
+      this.recomputePlanStatus(st.unit);
       return { admitted: false, reason: 'dependency_failed' };
     }
     if (anyDependencyPending) return { admitted: false, reason: 'dependency_unmet' };
@@ -252,6 +266,7 @@ export class Kernel {
     };
     st.attempts.push(attempt);
     st.status = 'running';
+    this.markPlanRunning(st.unit);
     this.emit('attempt.started', [unitId, attemptId], { ordinal, epoch, specHash: spec.hash });
 
     const result = runExecutor(
@@ -294,7 +309,16 @@ export class Kernel {
   /** Everything after executor exit. Idempotent and re-runnable — T-K6. */
   postExecution(unitId: string, attempt: Attempt, faults: Faults = {}): void {
     const st = this.expect(unitId);
+    try {
+      this.postExecutionInner(unitId, st, attempt, faults);
+    } finally {
+      // Recompute regardless of which exit path was taken above — cheap and
+      // idempotent (recomputePlanStatus no-ops once complete/partial).
+      this.recomputePlanStatus(st.unit);
+    }
+  }
 
+  private postExecutionInner(unitId: string, st: UnitState, attempt: Attempt, faults: Faults): void {
     // Fencing: harvest only if this attempt still holds the current epoch.
     if (attempt.leaseEpoch < st.epoch) {
       const idx = st.attempts.findIndex((a) => a.id === attempt.id);
@@ -434,6 +458,7 @@ export class Kernel {
     st.artifacts[st.artifacts.findIndex((a) => a.id === artifactId)] = { ...art, status: 'accepted' };
     st.status = 'accepted';
     this.emit('workunit.accepted', [unitId, artifactId], {});
+    this.recomputePlanStatus(st.unit);
     return { accepted: true };
   }
 
@@ -502,6 +527,49 @@ export class Kernel {
     try { execFileSync('git', ['worktree', 'remove', '--force', ref], { cwd: this.d.repoRoot, stdio: 'ignore' }); } catch { /* preserved */ }
   }
 
+  // ------------------------------------------------------------------ plan
+
+  /** Public projection read — Note 06 §2.4. Returns undefined if the plan was never materialised. */
+  planStatus(planId: string, version: string): TaskPlan['status'] | undefined {
+    return this.plans.get(`${planId}@${version}`)?.status;
+  }
+
+  /** `approved -> running`: "First node dispatched" — the first unit to actually reach `running`. */
+  private markPlanRunning(unit: WorkUnit): void {
+    const rec = this.plans.get(`${unit.planId}@${unit.planVersion}`);
+    if (!rec || rec.status !== 'approved') return; // idempotent: fires once
+    rec.status = 'running';
+    this.emit('plan.running', [unit.planId], { version: unit.planVersion }, null, unit.intentRef);
+  }
+
+  /**
+   * `running -> complete` (all nodes `accepted`) or `running -> partial` (all
+   * nodes terminal, >=1 not `accepted`) — Note 06 §2.4. A node's failure does
+   * not fail the plan (Note 02 §8 rule 5); independent branches are simply
+   * accounted for in `partial`. Safe to call redundantly — idempotent once
+   * the plan has resolved to `complete`/`partial`.
+   */
+  private recomputePlanStatus(unit: WorkUnit): void {
+    const rec = this.plans.get(`${unit.planId}@${unit.planVersion}`);
+    if (!rec || rec.status === 'complete' || rec.status === 'partial') return;
+
+    let allTerminal = true;
+    let allAccepted = true;
+    for (const node of rec.plan.nodes) {
+      const nodeKey = `${rec.plan.id}@${rec.plan.version}#${node.nodeId}`;
+      const member = [...this.units.values()].find((u) => materialKey(u.unit) === nodeKey);
+      if (!member || (member.status !== 'accepted' && !TERMINAL_UNIT_STATUSES.has(member.status))) {
+        allTerminal = false;
+        break;
+      }
+      if (member.status !== 'accepted') allAccepted = false;
+    }
+    if (!allTerminal) return;
+
+    rec.status = allAccepted ? 'complete' : 'partial';
+    this.emit(`plan.${rec.status}`, [unit.planId], { version: unit.planVersion }, null, unit.intentRef);
+  }
+
   // ---------------------------------------------------------------- helpers
 
   expect(unitId: string): UnitState {
@@ -524,8 +592,18 @@ export class Kernel {
 
 export const traceStore = new Map<string, string>();
 
-/** Non-`accepted` terminal statuses — matches sweepStaleReservations' terminal set (Note 06 §2.1). */
-const TERMINAL_UNIT_STATUSES = new Set<WorkUnitStatus>(['rejected', 'invalid', 'cancelled', 'escalated', 'exhausted']);
+/**
+ * Non-`accepted` terminal-or-terminal-like statuses, for dependency and plan
+ * aggregation purposes. Includes `blocked`: design/06 §2.1's own "Terminal:"
+ * list omits it, but no outgoing transition exists for it anywhere in that
+ * table, and Note 02 §8 rule 3 requires failure to propagate transitively
+ * (n1 fails -> n2 blocked -> n3 blocked). Without `blocked` here, a chain
+ * deeper than two nodes would stall a downstream unit in `validated` forever
+ * and a plan containing it could never reach `partial`. Deliberately NOT the
+ * same set sweepStaleReservations uses inline (a blocked unit never held a
+ * reservation, so that set has no reason to include it).
+ */
+const TERMINAL_UNIT_STATUSES = new Set<WorkUnitStatus>(['rejected', 'invalid', 'cancelled', 'escalated', 'exhausted', 'blocked']);
 
 function materialKey(u: WorkUnit): string { return `${u.planId}@${u.planVersion}#${u.planNodeId}`; }
 
