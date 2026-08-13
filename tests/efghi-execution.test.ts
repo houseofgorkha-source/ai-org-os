@@ -527,6 +527,99 @@ test('T-I6 two consecutive read-then-nothing attempts — the real aios-harness 
   assert.equal(u.executionSpec.onFailure['no_progress'], 'escalate_human', 'matches ROLE.onFailure — a driver stops retrying and escalates here');
 });
 
+// ---------- T-I7-I9: wiring canRetry()/noProgress() into admit() (design/06
+// §2.1's attempt_failed -> ready/exhausted/escalated). `attempt_failed` is
+// deliberately left unchanged by postExecution — T-F10/T-F13 already assert
+// it persists through one failed runAttempt with no admit() call. The
+// decision fires only when admit() is next called on that unit.
+
+test('T-I7 admit() allows a retry through when attempts remain and on_failure says retry, reaching success', () => {
+  const w = makeWorld({ script: DEFAULT_SCRIPT });
+  const u = w.kernel.materialise(w.plan, n(w), w.baseline);
+  w.kernel.acquireLease(u.id, 's1');
+  w.kernel.runAttempt(u.id, DEFAULT_SCRIPT);
+  assert.equal(w.kernel.expect(u.id).status, 'attempt_failed', 'unchanged: not auto-promoted at failure time');
+
+  const r = w.kernel.admit(u.id);
+  assert.equal(r.admitted, true, r.reason);
+  assert.equal(w.kernel.expect(u.id).status, 'ready', 'attempt_failed -> ready, via the existing admission path');
+
+  w.kernel.runAttempt(u.id, DEFAULT_SCRIPT);
+  const st = w.kernel.expect(u.id);
+  assert.equal(st.status, 'awaiting_approval', 'the retry, gated through admit(), completed successfully in the ordinary way');
+  assert.equal(w.kernel.escalations.filter((e) => e.unitId === u.id).length, 0, 'a legitimate retry never escalates');
+});
+
+test('T-I8 attempts exhausted (genuinely distinct failures, no progress-collapse) escalate through admit(), reusing the Escalation record', () => {
+  // Each attempt writes a still-broken migration with a different LINE
+  // COUNT (harvest.ts's insertions/deletions are a line-based diff stat,
+  // not content-based) so diffSummary — and therefore the progress hash —
+  // genuinely differs attempt to attempt. This isolates pure exhaustion
+  // from no_progress.
+  const BROKEN = 'function oldFn(a) { return a + 1; }\nfunction newFn(a) { return a + 1; }\n'
+    + 'function alpha(x) { return oldFn(x); }\nfunction beta(x) { return oldFn(x) * 2; }\n'
+    + 'module.exports = { alpha, beta, newFn, oldFn };\n';
+  let attemptCount = 0;
+  const alwaysFailDifferently = (_p: string, turn: number): string => {
+    if (turn === 1) return 'CALL fs.read workspace://src/app.js {"path":"src/app.js"}';
+    if (turn === 2) {
+      attemptCount += 1;
+      const content = `${BROKEN}${'// marker\n'.repeat(attemptCount)}`;
+      return `CALL fs.write workspace://src/app.js ${JSON.stringify({ path: 'src/app.js', content })}`;
+    }
+    return 'DONE';
+  };
+
+  const w = makeWorld({ script: alwaysFailDifferently });
+  const u = w.kernel.materialise(w.plan, n(w), w.baseline);
+  w.kernel.acquireLease(u.id, 's1');
+
+  w.kernel.runAttempt(u.id, alwaysFailDifferently);
+  let r = w.kernel.admit(u.id);
+  assert.equal(r.admitted, true, 'attempt 1 -> 2: within maxAttempts (3)');
+  assert.equal(w.kernel.expect(u.id).status, 'ready');
+
+  w.kernel.runAttempt(u.id, alwaysFailDifferently);
+  assert.equal(w.kernel.noProgress(u.id), false, 'diffs genuinely differ — this is exhaustion, not no_progress');
+  r = w.kernel.admit(u.id);
+  assert.equal(r.admitted, true, 'attempt 2 -> 3: still within maxAttempts');
+  assert.equal(w.kernel.expect(u.id).status, 'ready');
+
+  w.kernel.runAttempt(u.id, alwaysFailDifferently);
+  assert.equal(w.kernel.noProgress(u.id), false, 'still genuinely distinct');
+  r = w.kernel.admit(u.id);
+  assert.equal(r.admitted, false);
+  assert.equal(r.reason, 'exhausted');
+  assert.equal(w.kernel.expect(u.id).status, 'escalated', 'exhausted -> escalated fires in the same call (design: "Always")');
+  assert.ok(w.events.byType('workunit.exhausted').length >= 1, 'the momentary exhausted transition is still evented (T-K1)');
+  const esc = w.kernel.escalations.find((e) => e.unitId === u.id);
+  assert.ok(esc, 'reuses the existing Escalation record — not a duplicate mechanism');
+  assert.equal(esc!.klass, 'exhausted');
+});
+
+test('T-I9 no_progress escalates DIRECTLY via admit(), bypassing exhausted even with attempts remaining', () => {
+  const readThenNothing = (_p: string, turn: number): string =>
+    turn === 1 ? 'CALL fs.read workspace://src/app.js {"path":"src/app.js"}' : 'DONE';
+  const w = makeWorld({ script: readThenNothing });
+  const u = w.kernel.materialise(w.plan, n(w), w.baseline);
+  w.kernel.acquireLease(u.id, 's1');
+
+  w.kernel.runAttempt(u.id, readThenNothing);
+  const r1 = w.kernel.admit(u.id);
+  assert.equal(r1.admitted, true, 'one failure alone is not yet no_progress');
+  assert.equal(w.kernel.expect(u.id).status, 'ready');
+
+  w.kernel.runAttempt(u.id, readThenNothing);
+  assert.equal(w.kernel.noProgress(u.id), true, 'two identical-shaped failures, as in T-I6');
+  const r2 = w.kernel.admit(u.id);
+  assert.equal(r2.admitted, false);
+  assert.equal(r2.reason, 'no_progress');
+  assert.equal(w.kernel.expect(u.id).status, 'escalated');
+  assert.equal(w.kernel.expect(u.id).attempts.length, 2, 'only 2 of 3 allowed attempts used — proves this bypasses exhaustion, does not exhaust it');
+  const esc = w.kernel.escalations.find((e) => e.unitId === u.id);
+  assert.equal(esc!.klass, 'no_progress');
+});
+
 test('T-I5 a retry never mutates the WorkUnit contract', () => {
   const w = makeWorld({ script: DEFAULT_SCRIPT });
   const u = w.kernel.materialise(w.plan, n(w), w.baseline);

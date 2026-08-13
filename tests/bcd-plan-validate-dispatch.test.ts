@@ -475,3 +475,23 @@ test('T-D16 a pre-dispatch approval bound to a stale content hash does not satis
   assert.equal(r.reason, 'approval_missing');
   assert.equal(w.kernel.expect(u.id).status, 'validated');
 });
+
+test('T-D17 a unit that escalates via no_progress still resolves its plan to partial (commit 59a712d\'s aggregation)', () => {
+  const readThenNothing = (_p: string, turn: number): string =>
+    turn === 1 ? 'CALL fs.read workspace://src/app.js {"path":"src/app.js"}' : 'DONE';
+  const w = makeWorld({ script: readThenNothing });
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1] };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  w.kernel.acquireLease(u1.id, 's1');
+
+  w.kernel.runAttempt(u1.id, readThenNothing);
+  assert.equal(w.kernel.admit(u1.id).admitted, true, 'attempt_failed -> ready');
+
+  w.kernel.runAttempt(u1.id, readThenNothing);
+  const r = w.kernel.admit(u1.id);
+  assert.equal(r.reason, 'no_progress');
+  assert.equal(w.kernel.expect(u1.id).status, 'escalated');
+
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'partial', 'plan aggregation observes escalated as terminal-non-accepted');
+});

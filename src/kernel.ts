@@ -158,6 +158,41 @@ export class Kernel {
       return { admitted: false, reason: `status ${st.status}` };
     }
 
+    // Retry/exhaustion decision (Note 06 §2.1). `attempt_failed` stays
+    // exactly as it is written by postExecution — this is deliberately
+    // deferred, never automatic (T-F10/T-F13 assert `attempt_failed`
+    // persists through a single failed runAttempt with no admit() call).
+    // The decision fires here, the first time this unit is next admitted.
+    // Three distinct outcomes, not two: `no_progress`/`escalate_human` take
+    // priority over attempt count and escalate DIRECTLY, bypassing
+    // `exhausted` entirely — collapsing them into a single "exhausted"
+    // path would misreport why a unit stopped.
+    if (st.status === 'attempt_failed') {
+      const lastFailure = st.failures[st.failures.length - 1];
+      const klass = lastFailure?.klass ?? 'verification_failed';
+      const policy = st.unit.executionSpec.onFailure[klass];
+      const stalled = this.noProgress(unitId);
+      const attemptsRemain = st.attempts.filter((a) => a.status !== 'superseded').length < st.unit.budget.maxAttempts;
+
+      if (stalled || policy === 'escalate_human') {
+        st.status = 'escalated';
+        this.raiseEscalation(unitId, stalled ? 'no_progress' : klass);
+        this.recomputePlanStatus(st.unit);
+        return { admitted: false, reason: stalled ? 'no_progress' : 'escalate_human' };
+      }
+      if (!attemptsRemain) {
+        // `exhausted -> escalated`: momentary, design's only trigger is "Always".
+        st.status = 'exhausted';
+        this.emit('workunit.exhausted', [unitId], {});
+        st.status = 'escalated';
+        this.raiseEscalation(unitId, 'exhausted');
+        this.recomputePlanStatus(st.unit);
+        return { admitted: false, reason: 'exhausted' };
+      }
+      st.status = 'ready';
+      this.emit('workunit.ready', [unitId], {});
+    }
+
     // Dependency graph (Note 02 §8, Note 06 §2.1). Any failed upstream
     // dependency blocks the unit regardless of edge kind — the decided
     // resolution to §6's ambiguity. An unresolved (non-terminal) dependency
