@@ -16,7 +16,7 @@ import type { ModelProvider } from './broker.ts';
 import { runExecutor } from './executor.ts';
 import { freezeWorkspace, harvest, dedupeArtifact, git } from './harvest.ts';
 import { runGates } from './gates.ts';
-import { quorumMet } from './validate.ts';
+import { quorumMet, validateDispatchApprovals } from './validate.ts';
 import { hashOf, nextId, now, nowMs, plusSeconds, sha256 } from './util.ts';
 
 /**
@@ -180,6 +180,19 @@ export class Kernel {
       return { admitted: false, reason: 'dependency_failed' };
     }
     if (anyDependencyPending) return { admitted: false, reason: 'dependency_unmet' };
+
+    // Blocking pre-dispatch approvals (Note 02 §9 / Note 06 §2.1 — the other
+    // half of `ready`'s trigger, alongside dependencies). Reuses the C12
+    // validator (validate.ts) unchanged; defers, never locks, same posture
+    // as every other check in this function.
+    const needsPreDispatchApproval = st.unit.approvalsRequired.some((a) => a.blocking && a.kind === 'pre_dispatch');
+    if (needsPreDispatchApproval) {
+      const planRec = this.plans.get(`${st.unit.planId}@${st.unit.planVersion}`);
+      const planContentHash = planRec ? hashOf(planRec.plan) : '';
+      if (!validateDispatchApprovals(st.unit, planContentHash, this.approvals).ok) {
+        return { admitted: false, reason: 'approval_missing' };
+      }
+    }
 
     const running = [...this.units.values()].filter((u) => u.status === 'running');
     if (running.length >= this.d.policy.budgetPolicy.maxRunningUnits) return { admitted: false, reason: 'max_running_units' };

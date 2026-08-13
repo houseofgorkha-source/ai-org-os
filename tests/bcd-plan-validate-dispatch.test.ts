@@ -433,3 +433,45 @@ test('T-D13 plan-completion events are idempotent under repeated recomputation',
   w.kernel.accept(u1.id, art.id);
   assert.equal(w.events.byType('plan.complete').length, 1, 'a second recomputation does not re-emit the transition');
 });
+
+// -------------------------------------- C12 pre-dispatch approval, wired in
+// Note 02 §9 / Note 06 §2.1: `ready`'s trigger is dependencies AND blocking
+// pre-dispatch approvals. Reuses validateDispatchApprovals (T-C12) unchanged
+// through admit(), which previously never called it.
+
+test('T-D14 admit() defers a unit with an unmet blocking pre-dispatch approval', () => {
+  const w = makeWorld();
+  const n = { ...node(w.plan), approvalsRequired: [{ kind: 'pre_dispatch', subject: 'plan', blocking: true }] };
+  const plan: TaskPlan = { ...w.plan, nodes: [n] };
+  const u = w.kernel.materialise(plan, n, w.baseline);
+
+  const r = w.kernel.admit(u.id);
+  assert.equal(r.admitted, false);
+  assert.equal(r.reason, 'approval_missing');
+  assert.equal(w.kernel.expect(u.id).status, 'validated', 'deferred, not locked, not blocked');
+});
+
+test('T-D15 admit() succeeds once the pre-dispatch approval is bound to the plan content hash', () => {
+  const w = makeWorld();
+  const n = { ...node(w.plan), approvalsRequired: [{ kind: 'pre_dispatch', subject: 'plan', blocking: true }] };
+  const plan: TaskPlan = { ...w.plan, nodes: [n] };
+  const u = w.kernel.materialise(plan, n, w.baseline);
+  w.kernel.recordApproval(approvalFor('plan', plan.id, planHash(plan)));
+
+  const r = w.kernel.admit(u.id);
+  assert.equal(r.admitted, true, r.reason);
+  assert.equal(w.kernel.expect(u.id).status, 'ready');
+});
+
+test('T-D16 a pre-dispatch approval bound to a stale content hash does not satisfy admission', () => {
+  const w = makeWorld();
+  const n = { ...node(w.plan), approvalsRequired: [{ kind: 'pre_dispatch', subject: 'plan', blocking: true }] };
+  const plan: TaskPlan = { ...w.plan, nodes: [n] };
+  const u = w.kernel.materialise(plan, n, w.baseline);
+  w.kernel.recordApproval(approvalFor('plan', plan.id, 'sha256:stale-hash'));
+
+  const r = w.kernel.admit(u.id);
+  assert.equal(r.admitted, false);
+  assert.equal(r.reason, 'approval_missing');
+  assert.equal(w.kernel.expect(u.id).status, 'validated');
+});
