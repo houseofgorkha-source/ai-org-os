@@ -1,2 +1,14 @@
 node_modules/
 .tmp/
+
+# secrets
+.env
+.env.local
+.env.*.local
+
+# Claude Code local machine state
+.claude/settings.local.json
+
+# OS cruft
+.DS_Store
+Thumbs.db
