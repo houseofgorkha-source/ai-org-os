@@ -526,6 +526,18 @@ export interface Approval {
   readonly scope: { readonly reuse: 'one_time' | 'until_timestamp' | 'for_plan'; readonly expiresAt: Timestamp | null };
 }
 
+// ---------------------------------------------------------------- escalation
+
+/** Note 06 §11 event contract: "Escalation | raised, resolved". No new trigger — records the existing escalation.raised sites. */
+export interface Escalation {
+  readonly id: string;
+  readonly unitId: WorkUnitId;
+  readonly klass: string;
+  readonly raisedAt: Timestamp;
+  readonly resolvedAt: Timestamp | null;
+  readonly resolution: string | null;
+}
+
 // --------------------------------------------------------------------- lease
 
 export interface Lease {

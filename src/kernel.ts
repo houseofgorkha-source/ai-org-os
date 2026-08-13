@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, rmSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type {
   TaskPlan, PlanNode, WorkUnit, WorkUnitStatus, Attempt, AttemptStatus, Artifact,
-  Approval, FailureRecord, GateResult, Lease, Money, EffectiveBudget, ContextManifest, DenialRecord,
+  Approval, Escalation, FailureRecord, GateResult, Lease, Money, EffectiveBudget, ContextManifest, DenialRecord,
 } from './types.ts';
 import type { Registry } from './registry.ts';
 import type { InstancePolicy, TierBindingResolver } from './resolve.ts';
@@ -82,6 +82,8 @@ export class Kernel {
   private readonly d: KernelDeps;
   readonly units = new Map<string, UnitState>();
   readonly approvals: Approval[] = [];
+  /** Note 06 §11: "Escalation | raised, resolved". No new trigger — records the existing escalation.raised sites. */
+  readonly escalations: Escalation[] = [];
   readonly account: BudgetAccount;
   private readonly compiler: ContextCompiler;
   /** Plan-level status projection (Note 06 §2.4), keyed by plan.id@plan.version. Never mutates the input TaskPlan. */
@@ -345,7 +347,7 @@ export class Kernel {
     if (attempt.status === 'denied') {
       this.recordFailure(st, attempt, 'capability_denied', [], []);
       st.status = 'escalated';
-      this.emit('escalation.raised', [unitId], { klass: 'capability_denied' });
+      this.raiseEscalation(unitId, 'capability_denied');
       this.releaseReservation(st);
       return;
     }
@@ -380,7 +382,7 @@ export class Kernel {
     }
     if (gr.indeterminate) {
       st.status = 'escalated';
-      this.emit('escalation.raised', [unitId], { klass: 'indeterminate', gate: gr.indeterminate.gateRef });
+      this.raiseEscalation(unitId, 'indeterminate', { gate: gr.indeterminate.gateRef });
       this.releaseReservation(st);
       return;
     }
@@ -447,6 +449,27 @@ export class Kernel {
     const st = this.expect(unitId);
     if (this.noProgress(unitId)) return false;
     return st.attempts.filter((a) => a.status !== 'superseded').length < st.unit.budget.maxAttempts;
+  }
+
+  // ----------------------------------------------------------- escalation
+
+  /** Records the existing escalation.raised sites as a real Escalation, not just an event. No new trigger. */
+  private raiseEscalation(unitId: string, klass: string, extra: Record<string, unknown> = {}): void {
+    const id = nextId('esc');
+    const rec: Escalation = { id, unitId, klass, raisedAt: now(), resolvedAt: null, resolution: null };
+    this.escalations.push(rec);
+    this.emit('escalation.raised', [unitId], { klass, ...extra });
+  }
+
+  /** Human-only by convention, same as recordApproval. Idempotent: a second call on an already-resolved escalation is refused, not silently re-applied. */
+  resolveEscalation(id: string, resolution: string): { resolved: boolean; reason?: string } {
+    const idx = this.escalations.findIndex((e) => e.id === id);
+    if (idx < 0) return { resolved: false, reason: 'unknown escalation' };
+    const esc = this.escalations[idx]!;
+    if (esc.resolvedAt) return { resolved: false, reason: 'already resolved' };
+    this.escalations[idx] = { ...esc, resolvedAt: now(), resolution };
+    this.emit('escalation.resolved', [esc.unitId], { escalationId: id, resolution });
+    return { resolved: true };
   }
 
   // -------------------------------------------------------------- approval

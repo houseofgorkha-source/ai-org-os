@@ -186,6 +186,25 @@ test('T-F4 the denial budget escalates as capability_denied and never retries', 
   assert.equal(denials[4]!.budgetRemaining, 0, 'budget is exhausted by the final recorded denial');
 });
 
+test('T-F4b the capability_denied escalation is a real, queryable Escalation record', () => {
+  const spam = (_p: string, t: number): string =>
+    t <= 6 ? 'CALL net.fetch https://x.invalid/a {"path":"a"}' : 'DONE';
+  const { w, u } = run(spam);
+  const esc = w.kernel.escalations.find((e) => e.unitId === u.id);
+  assert.ok(esc, 'a real Escalation record exists, not just an event');
+  assert.equal(esc!.klass, 'capability_denied');
+  assert.equal(esc!.resolvedAt, null);
+
+  const r1 = w.kernel.resolveEscalation(esc!.id, 'reviewed, retrying with a corrected capability profile');
+  assert.equal(r1.resolved, true);
+  assert.ok(w.kernel.escalations.find((e) => e.id === esc!.id)!.resolvedAt);
+  assert.equal(w.events.byType('escalation.resolved').length, 1);
+
+  const r2 = w.kernel.resolveEscalation(esc!.id, 'again');
+  assert.equal(r2.resolved, false, 'already-resolved escalations are refused, not silently re-applied');
+  assert.equal(w.events.byType('escalation.resolved').length, 1, 'no duplicate event on the idempotent refusal');
+});
+
 test('T-F5 the executor holds no credentials; model_served is recorded per call', () => {
   const { a } = run(FIXING_SCRIPT);
   assert.ok(a.modelInvocations.length >= 1);
@@ -386,6 +405,17 @@ test('T-H3 quorum disagreement yields `indeterminate` and escalates, never the m
   assert.equal(st.status, 'escalated');
   assert.ok(st.gateResults.some((r) => r.verdict === 'indeterminate'));
   assert.equal(st.failures.length, 0, 'indeterminate is not a failure');
+});
+
+test('T-H3b the indeterminate escalation is also a real Escalation record', () => {
+  const w = makeWorld({ script: FIXING_SCRIPT });
+  const u = w.kernel.materialise(w.plan, n(w), w.baseline);
+  w.kernel.acquireLease(u.id, 's1');
+  w.kernel.runAttempt(u.id, FIXING_SCRIPT, { flakyGates: ['tests.affected_pass'] });
+  const esc = w.kernel.escalations.find((e) => e.unitId === u.id);
+  assert.ok(esc, 'a real Escalation record exists, not just an event');
+  assert.equal(esc!.klass, 'indeterminate');
+  assert.equal(esc!.resolvedAt, null);
 });
 
 test('T-H4 gates run in stage-ascending order', () => {
