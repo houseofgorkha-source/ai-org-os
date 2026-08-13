@@ -96,6 +96,25 @@ export class Kernel {
 
     const spec = resolveSpec(node, this.d.registry, this.d.policy, this.d.resolver, plan.budgetAggregate.execution);
     const budget: EffectiveBudget = spec.effectiveBudget;
+
+    // Note 02 §8 / E1.3: only `artifact` and `ordering` edges are authored;
+    // `resource` conflicts are derived separately (admit(), unchanged).
+    // Predecessors must already be materialised — materialise() stays a
+    // per-node primitive; the caller is responsible for topological order.
+    const dependsOn = plan.edges
+      .filter((e) => e.to === node.nodeId)
+      .map((e) => {
+        const predKey = `${plan.id}@${plan.version}#${e.from}`;
+        const pred = [...this.units.values()].find((u) => materialKey(u.unit) === predKey);
+        if (!pred) {
+          throw new Error(
+            `materialise: predecessor node '${e.from}' for '${node.nodeId}' is not yet materialised — ` +
+            `dependency edges require predecessors to be materialised first`,
+          );
+        }
+        return { unitId: pred.unit.id, kind: e.kind };
+      });
+
     const unit: WorkUnit = {
       id: nextId('wu'),
       instanceId: this.d.instanceId,
@@ -103,7 +122,7 @@ export class Kernel {
       klass: node.klass, objective: node.objective, intentRef: plan.intentRef,
       inputs: [], expectedOutput: node.expectedOutput,
       acceptanceCriteria: node.acceptanceCriteria, constraints: node.constraints,
-      executionSpec: spec, dependsOn: [], affectedPaths: node.affectedPaths,
+      executionSpec: spec, dependsOn, affectedPaths: node.affectedPaths,
       budget, approvalsRequired: node.approvalsRequired, baselineCommit,
     };
     this.units.set(unit.id, {
@@ -123,6 +142,31 @@ export class Kernel {
     if (st.status !== 'validated' && st.status !== 'ready' && st.status !== 'attempt_failed') {
       return { admitted: false, reason: `status ${st.status}` };
     }
+
+    // Dependency graph (Note 02 §8, Note 06 §2.1). Any failed upstream
+    // dependency blocks the unit regardless of edge kind — the decided
+    // resolution to §6's ambiguity. An unresolved (non-terminal) dependency
+    // defers admission without touching status, same "defer, never lock"
+    // posture as the scope-conflict check below.
+    let anyDependencyFailed = false;
+    let anyDependencyPending = false;
+    let failedDependency: { unitId: string; kind: string } | null = null;
+    for (const dep of st.unit.dependsOn) {
+      const depState = this.units.get(dep.unitId);
+      if (!depState) continue;
+      if (depState.status === 'accepted') continue;
+      if (TERMINAL_UNIT_STATUSES.has(depState.status)) { anyDependencyFailed = true; failedDependency = dep; }
+      else anyDependencyPending = true;
+    }
+    if (anyDependencyFailed) {
+      // The entry guard above already limits st.status to validated/ready/
+      // attempt_failed here, so this is always a fresh transition into blocked.
+      st.status = 'blocked';
+      this.emit('workunit.blocked', [unitId], { failedDependency: failedDependency!.unitId, kind: failedDependency!.kind });
+      return { admitted: false, reason: 'dependency_failed' };
+    }
+    if (anyDependencyPending) return { admitted: false, reason: 'dependency_unmet' };
+
     const running = [...this.units.values()].filter((u) => u.status === 'running');
     if (running.length >= this.d.policy.budgetPolicy.maxRunningUnits) return { admitted: false, reason: 'max_running_units' };
     // Derived conflict edges: no two running units may overlap in scope.
@@ -132,6 +176,14 @@ export class Kernel {
     const ceiling = st.unit.budget.execution.costCeiling;
     if (this.account.reserved + this.account.spent + ceiling > this.account.dayCap) {
       return { admitted: false, reason: 'instance_budget_headroom' };
+    }
+
+    // Note 06 §2.1: `validated -> ready` once dependencies and admission are
+    // satisfied. Smallest transition that keeps the status observable and
+    // eventable without a separate scheduling pass (§6 ambiguity 4).
+    if (st.status === 'validated') {
+      st.status = 'ready';
+      this.emit('workunit.ready', [unitId], {});
     }
     return { admitted: true };
   }
@@ -471,6 +523,9 @@ export class Kernel {
 }
 
 export const traceStore = new Map<string, string>();
+
+/** Non-`accepted` terminal statuses — matches sweepStaleReservations' terminal set (Note 06 §2.1). */
+const TERMINAL_UNIT_STATUSES = new Set<WorkUnitStatus>(['rejected', 'invalid', 'cancelled', 'escalated', 'exhausted']);
 
 function materialKey(u: WorkUnit): string { return `${u.planId}@${u.planVersion}#${u.planNodeId}`; }
 

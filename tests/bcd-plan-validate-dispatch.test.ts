@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeWorld, makePlan, POLICY, planHash } from '../src/slice01.ts';
+import { makeWorld, makePlan, POLICY, planHash, FIXING_SCRIPT, approvalFor } from '../src/slice01.ts';
 import { validatePlan, validateDispatchApprovals } from '../src/validate.ts';
 import type { ValidationEnv } from '../src/validate.ts';
 import type { TaskPlan, PlanNode } from '../src/types.ts';
@@ -206,4 +206,95 @@ test('T-D4 admission control defers on scope conflict rather than locking', () =
   assert.equal(r.admitted, false);
   assert.ok(r.reason === 'scope_conflict' || r.reason === 'max_running_units');
   assert.equal(w.kernel.expect(u2.id).status, 'validated', 'work waits; it does not deadlock');
+});
+
+// -------------------------------------------------- D5-D7: dependency graph
+// A real two-node plan, exercised for the first time (Note 02 §8, Note 06
+// §2.1) — Slice 01 itself never authors an edge. Ordering and artifact edges
+// are deliberately tested identically: a failed upstream dependency blocks
+// regardless of edge kind (resolved ambiguity from the planning pass).
+
+for (const kind of ['ordering', 'artifact'] as const) {
+  test(`T-D5 (${kind}) admission defers until the dependency is accepted, then admits`, () => {
+    const w = makeWorld();
+    const n1 = { ...node(w.plan), nodeId: 'n1' };
+    const n2 = { ...node(w.plan), nodeId: 'n2' };
+    const plan: TaskPlan = { ...w.plan, nodes: [n1, n2], edges: [{ from: 'n1', to: 'n2', kind }] };
+    const u1 = w.kernel.materialise(plan, n1, w.baseline);
+    const u2 = w.kernel.materialise(plan, n2, w.baseline);
+    assert.deepEqual(u2.dependsOn, [{ unitId: u1.id, kind }], 'dependsOn is populated from the authored edge');
+
+    const deferred = w.kernel.admit(u2.id);
+    assert.equal(deferred.admitted, false);
+    assert.equal(deferred.reason, 'dependency_unmet');
+    assert.equal(w.kernel.expect(u2.id).status, 'validated', 'deferred, not locked, not blocked');
+
+    w.kernel.expect(u1.id).status = 'accepted';
+    const r = w.kernel.admit(u2.id);
+    assert.equal(r.admitted, true);
+    assert.equal(w.kernel.expect(u2.id).status, 'ready', 'validated -> ready once dependencies and admission are satisfied (Note 06 §2.1)');
+  });
+}
+
+test('T-D6 a failed upstream dependency blocks the successor regardless of edge kind', () => {
+  const w = makeWorld();
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1, n2], edges: [{ from: 'n1', to: 'n2', kind: 'ordering' }] };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  const u2 = w.kernel.materialise(plan, n2, w.baseline);
+
+  w.kernel.expect(u1.id).status = 'exhausted'; // terminal, not accepted
+  const r = w.kernel.admit(u2.id);
+  assert.equal(r.admitted, false);
+  assert.equal(r.reason, 'dependency_failed');
+  assert.equal(w.kernel.expect(u2.id).status, 'blocked', 'blocked, never attempt_failed (Note 02 §2)');
+  assert.equal(w.kernel.expect(u2.id).failures.length, 0, 'a blocked unit did nothing wrong — no FailureRecord');
+  assert.equal(w.kernel.expect(u2.id).attempts.length, 0, 'no attempt is consumed');
+  assert.ok(w.events.byType('workunit.blocked').length >= 1);
+});
+
+test('T-D7 materialising a dependent node before its predecessor is a caller error, not a silent gap', () => {
+  const w = makeWorld();
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1, n2], edges: [{ from: 'n1', to: 'n2', kind: 'ordering' }] };
+  assert.throws(() => w.kernel.materialise(plan, n2, w.baseline), /not yet materialised/);
+});
+
+test('T-D8 a dependency-satisfied unit is driven through the full post-admission lifecycle to accepted', () => {
+  // Closes the gap the prior verification pass found: T-D5 proved admit()'s
+  // decision in isolation only. This drives the dependent unit through the
+  // SAME acquireLease -> runAttempt -> harvest -> gates -> approval -> accept
+  // machinery every other passing-attempt test already uses (fullRun()'s
+  // pattern in jklm-approval-replay-budget.test.ts, T-J1), with no new helper.
+  const w = makeWorld({ script: FIXING_SCRIPT });
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1, n2], edges: [{ from: 'n1', to: 'n2', kind: 'ordering' }] };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  const u2 = w.kernel.materialise(plan, n2, w.baseline);
+
+  // n1 in the terminal state a satisfied dependency requires (T-D5's own pattern).
+  w.kernel.expect(u1.id).status = 'accepted';
+
+  const admission = w.kernel.admit(u2.id);
+  assert.equal(admission.admitted, true);
+  assert.equal(w.kernel.expect(u2.id).status, 'ready', 'validated -> ready once the dependency is satisfied');
+
+  // Existing lifecycle, unmodified: acquireLease -> runAttempt -> harvest -> gates.
+  w.kernel.acquireLease(u2.id, 's1');
+  w.kernel.runAttempt(u2.id, FIXING_SCRIPT);
+  const st = w.kernel.expect(u2.id);
+  assert.equal(st.status, 'awaiting_approval', 'ready -> running -> verifying -> awaiting_approval, same as any other unit');
+
+  // Existing merge-approval -> accept lifecycle, unmodified (T-J1's pattern).
+  const art = st.artifacts[st.artifacts.length - 1]!;
+  w.kernel.recordApproval(approvalFor('merge', art.id, art.contentHash));
+  const accepted = w.kernel.accept(u2.id, art.id);
+  assert.equal(accepted.accepted, true, accepted.reason);
+  assert.equal(w.kernel.expect(u2.id).status, 'accepted', 'the dependency-satisfied unit reaches the normal successful terminal state');
+
+  assert.equal(st.failures.length, 0, 'no dependency-related or any other failure occurred');
+  assert.equal(w.events.byType('workunit.blocked').length, 0, 'never blocked at any point in this run');
 });
