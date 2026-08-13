@@ -533,6 +533,58 @@ export class Kernel {
     return { accepted: true };
   }
 
+  /**
+   * `awaiting_approval -> rejected`, human only (Note 06 §2.1). Unlike
+   * accept(), there is no gate-passing check to anchor correctness on, so
+   * the source-status guard is explicit here. The artifact was EVALUATED
+   * and failed — `rejected`, never `abandoned` (Note 02 §13's distinction).
+   */
+  reject(unitId: string, artifactId: string): { rejected: boolean; reason?: string } {
+    const st = this.expect(unitId);
+    if (st.status !== 'awaiting_approval') return { rejected: false, reason: `status ${st.status}` };
+    const art = st.artifacts.find((a) => a.id === artifactId);
+    if (!art) return { rejected: false, reason: 'unknown artifact' };
+    const rj = this.approvals.find((x) =>
+      x.subject.kind === 'merge' && x.subject.ref === artifactId &&
+      x.subject.contentHash === art.contentHash && x.decision === 'reject' && quorumMet(x));
+    if (!rj) return { rejected: false, reason: 'no reject decision bound to this content hash' };
+    st.artifacts[st.artifacts.findIndex((a) => a.id === artifactId)] = { ...art, status: 'rejected' };
+    st.status = 'rejected';
+    this.emit('workunit.rejected', [unitId, artifactId], {});
+    this.recomputePlanStatus(st.unit);
+    return { rejected: true };
+  }
+
+  /**
+   * *Any non-terminal -> cancelled*, human, direct call (Note 06 §2.1; the
+   * "kernel on parent-plan failure" cascade is a separate, larger slice —
+   * not implemented here). `running`/`verifying` are excluded because they
+   * are never externally observable: runAttempt() is a single synchronous
+   * call with no yield point, so nothing can call cancel() while a unit is
+   * genuinely mid-attempt — by the time any caller regains control, the
+   * unit has already left that status. No reservation/workspace cleanup is
+   * needed: every reachable status has already released its reservation
+   * (postExecution does so on every exit path) and workspaces are already
+   * preserved by default (T-G5) — cancellation changes no mechanism there,
+   * only the terminal status. Descendant-blocking and plan-aggregation to
+   * `partial` need no new code either: `admit()` and recomputePlanStatus
+   * already treat `cancelled` as a terminal-failure status (added in the
+   * DAG slice, before anything could produce it).
+   */
+  cancel(unitId: string, reason: string): { cancelled: boolean; reason?: string } {
+    const st = this.expect(unitId);
+    if (!CANCELLABLE_STATUSES.has(st.status)) return { cancelled: false, reason: `status ${st.status}` };
+    for (let i = 0; i < st.artifacts.length; i++) {
+      const a = st.artifacts[i]!;
+      // Cut short, never evaluated: `abandoned`, never `rejected` (Note 02 §13).
+      if (a.status === 'draft' || a.status === 'verified') st.artifacts[i] = { ...a, status: 'abandoned' };
+    }
+    st.status = 'cancelled';
+    this.emit('workunit.cancelled', [unitId], { reason });
+    this.recomputePlanStatus(st.unit);
+    return { cancelled: true };
+  }
+
   // -------------------------------------------------------------- recovery
 
   /**
@@ -675,6 +727,15 @@ export const traceStore = new Map<string, string>();
  * reservation, so that set has no reason to include it).
  */
 const TERMINAL_UNIT_STATUSES = new Set<WorkUnitStatus>(['rejected', 'invalid', 'cancelled', 'escalated', 'exhausted', 'blocked']);
+
+/**
+ * Statuses cancel() actually accepts. Not literally "any non-terminal"
+ * (design/06 §2.1's phrase): `running`/`verifying` are excluded as
+ * unreachable (see cancel()'s own comment), and `blocked` is included per
+ * its own absence from the design's "Terminal:" list (a prior finding,
+ * treated here as the resolved reading, not re-litigated).
+ */
+const CANCELLABLE_STATUSES = new Set<WorkUnitStatus>(['validated', 'ready', 'blocked', 'attempt_failed', 'awaiting_approval']);
 
 function materialKey(u: WorkUnit): string { return `${u.planId}@${u.planVersion}#${u.planNodeId}`; }
 

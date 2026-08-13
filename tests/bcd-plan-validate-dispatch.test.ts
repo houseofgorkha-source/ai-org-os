@@ -495,3 +495,39 @@ test('T-D17 a unit that escalates via no_progress still resolves its plan to par
 
   assert.equal(w.kernel.planStatus(plan.id, plan.version), 'partial', 'plan aggregation observes escalated as terminal-non-accepted');
 });
+
+test('T-D18 a cancelled predecessor blocks its descendant through the existing admit() dependency check, no new code', () => {
+  const w = makeWorld();
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1, n2], edges: [{ from: 'n1', to: 'n2', kind: 'ordering' }] };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  const u2 = w.kernel.materialise(plan, n2, w.baseline);
+
+  assert.equal(w.kernel.cancel(u1.id, 'no longer needed').cancelled, true);
+  const r = w.kernel.admit(u2.id);
+  assert.equal(r.admitted, false);
+  assert.equal(r.reason, 'dependency_failed', 'cancelled is classified exactly like escalated/exhausted — TERMINAL_UNIT_STATUSES already included it');
+  assert.equal(w.kernel.expect(u2.id).status, 'blocked');
+});
+
+test('T-D19 a plan containing a rejected or cancelled unit resolves to partial through the existing aggregation, no new code', () => {
+  const w = makeWorld({ script: FIXING_SCRIPT });
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1, n2] };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  const u2 = w.kernel.materialise(plan, n2, w.baseline);
+
+  w.kernel.acquireLease(u1.id, 's1');
+  w.kernel.runAttempt(u1.id, FIXING_SCRIPT);
+  const st1 = w.kernel.expect(u1.id);
+  const art1 = st1.artifacts[st1.artifacts.length - 1]!;
+  w.kernel.recordApproval(approvalFor('merge', art1.id, art1.contentHash));
+  w.kernel.accept(u1.id, art1.id);
+  assert.equal(w.kernel.expect(u1.id).status, 'accepted');
+
+  assert.equal(w.kernel.cancel(u2.id, 'not proceeding').cancelled, true);
+
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'partial', 'one accepted, one cancelled — plan aggregation already classifies cancelled as terminal-non-accepted');
+});

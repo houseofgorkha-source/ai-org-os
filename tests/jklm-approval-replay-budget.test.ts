@@ -83,6 +83,91 @@ test('T-J4 a unit with unmet blocking gates is never accepted', () => {
   assert.match(r.reason!, /blocking gates/);
 });
 
+// -------------------------------------------- J5-J9: reject() and cancel()
+// Note 06 §2.1/§2.4, Note 02 §13. `reject()` mirrors accept()'s hash-binding
+// but consumes a `reject` decision instead of `approve`. `cancel()` reuses
+// the dependency-blocking (admit()) and plan-aggregation (recomputePlanStatus)
+// machinery from the DAG/plan-2 slices unchanged — proven, not assumed, by
+// T-D18/T-D19 in bcd-plan-validate-dispatch.test.ts.
+
+test('T-J5 reject() closes an awaiting_approval unit as rejected, artifact included', () => {
+  const { w, u, art } = fullRun();
+  const rejectDecision: Approval = {
+    id: 'rej_1', subject: { kind: 'merge', ref: art.id, contentHash: art.contentHash },
+    decision: 'reject', quorum: '1 of 1', approvers: ['human:founder'],
+    signatures: [{ approver: 'human:founder', decidedAt: 'now', contentHash: art.contentHash }],
+    blocking: true, decidedAt: 'now', scope: { reuse: 'one_time', expiresAt: null },
+  };
+  w.kernel.recordApproval(rejectDecision);
+  const r = w.kernel.reject(u.id, art.id);
+  assert.equal(r.rejected, true, r.reason);
+  assert.equal(w.kernel.expect(u.id).status, 'rejected');
+  assert.equal(w.kernel.expect(u.id).artifacts.find((a) => a.id === art.id)!.status, 'rejected', 'evaluated and failed, not abandoned (Note 02 §13)');
+});
+
+test('T-J6 reject() refuses a decision bound to a stale content hash', () => {
+  const { w, u, art } = fullRun();
+  const staleReject: Approval = {
+    id: 'rej_2', subject: { kind: 'merge', ref: art.id, contentHash: 'sha256:stale-hash' },
+    decision: 'reject', quorum: '1 of 1', approvers: ['human:founder'],
+    signatures: [{ approver: 'human:founder', decidedAt: 'now', contentHash: 'sha256:stale-hash' }],
+    blocking: true, decidedAt: 'now', scope: { reuse: 'one_time', expiresAt: null },
+  };
+  w.kernel.recordApproval(staleReject);
+  const r = w.kernel.reject(u.id, art.id);
+  assert.equal(r.rejected, false);
+  assert.equal(w.kernel.expect(u.id).status, 'awaiting_approval', 'unchanged — a stale-hash decision binds nothing');
+});
+
+test('T-J7 cancel() on a unit with no attempt yet touches no artifacts and needs no reservation/workspace cleanup', () => {
+  const w = makeWorld();
+  const u = w.kernel.materialise(w.plan, n(w), w.baseline);
+  const r = w.kernel.cancel(u.id, 'no longer needed');
+  assert.equal(r.cancelled, true, r.reason);
+  assert.equal(w.kernel.expect(u.id).status, 'cancelled');
+  assert.equal(w.kernel.expect(u.id).artifacts.length, 0);
+});
+
+test('T-J8 cancel() on an attempt_failed unit abandons its artifact and never mutates the prior Attempt', () => {
+  const w = makeWorld({ script: DEFAULT_SCRIPT });
+  const u = w.kernel.materialise(w.plan, n(w), w.baseline);
+  w.kernel.acquireLease(u.id, 's1');
+  w.kernel.runAttempt(u.id, DEFAULT_SCRIPT); // attempt 1 fails, genuinely
+  const before = w.kernel.expect(u.id);
+  assert.equal(before.status, 'attempt_failed');
+  const attemptBefore = JSON.stringify(before.attempts[0]);
+  const artIdBefore = before.artifacts[0]!.id;
+
+  const r = w.kernel.cancel(u.id, 'abandoning this unit');
+  assert.equal(r.cancelled, true, r.reason);
+  const after = w.kernel.expect(u.id);
+  assert.equal(after.status, 'cancelled');
+  assert.equal(after.artifacts.find((a) => a.id === artIdBefore)!.status, 'abandoned', 'cut short, never evaluated — abandoned, not rejected (Note 02 §13)');
+  assert.equal(JSON.stringify(after.attempts[0]), attemptBefore, 'the prior terminal Attempt is immutable — never retroactively marked cancelled (Note 06 §2.2)');
+});
+
+test('T-J9 reject()/cancel() are idempotent: a second call on an already-terminal unit is refused, not silently re-applied', () => {
+  const { w, u, art } = fullRun();
+  const rejectDecision: Approval = {
+    id: 'rej_3', subject: { kind: 'merge', ref: art.id, contentHash: art.contentHash },
+    decision: 'reject', quorum: '1 of 1', approvers: ['human:founder'],
+    signatures: [{ approver: 'human:founder', decidedAt: 'now', contentHash: art.contentHash }],
+    blocking: true, decidedAt: 'now', scope: { reuse: 'one_time', expiresAt: null },
+  };
+  w.kernel.recordApproval(rejectDecision);
+  assert.equal(w.kernel.reject(u.id, art.id).rejected, true);
+  const second = w.kernel.reject(u.id, art.id);
+  assert.equal(second.rejected, false, 'already rejected — refused, not re-applied');
+  assert.equal(w.events.byType('workunit.rejected').length, 1, 'no duplicate event');
+
+  const w2 = makeWorld();
+  const u2 = w2.kernel.materialise(w2.plan, n(w2), w2.baseline);
+  assert.equal(w2.kernel.cancel(u2.id, 'first').cancelled, true);
+  const secondCancel = w2.kernel.cancel(u2.id, 'second');
+  assert.equal(secondCancel.cancelled, false, 'already cancelled — refused, not re-applied');
+  assert.equal(w2.events.byType('workunit.cancelled').length, 1, 'no duplicate event');
+});
+
 // ======================================= K. Events, replay, and recovery
 
 test('T-K1 all state is a projection: rebuilding from events alone matches', () => {
