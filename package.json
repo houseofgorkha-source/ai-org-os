@@ -1,0 +1,17 @@
+{
+  "name": "ai-org-os",
+  "version": "0.1.0-slice01",
+  "private": true,
+  "type": "module",
+  "description": "AI Organization OS — Slice 01 vertical slice. Scope is fixed by design/SLICE-01-acceptance-checklist.md.",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types \"tests/**/*.test.ts\"",
+    "acceptance": "npm run typecheck && node --test --experimental-strip-types \"tests/**/*.test.ts\""
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "@types/node": "^22.10.2"
+  }
+}
