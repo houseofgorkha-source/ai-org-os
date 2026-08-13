@@ -10,7 +10,7 @@ Operating contract for Claude Code sessions in this repository. Read this first,
 
 **Current purpose:** prove the architecture works by building it in vertical slices, smallest first.
 
-**Current phase:** architecture complete and applied; **Slice 01 implemented and passing**. Moving from architecture into ongoing implementation.
+**Current phase:** architecture complete and applied; **Slice 01 implemented and passing**; Slice 1.5 (real-model validation) empirically proven once; **Slice 2 (kernel lifecycle completion) underway** — five bounded increments shipped so far (dependency scheduling, plan-level status aggregation, pre-dispatch approval enforcement, escalation lifecycle records, attempt retry/exhaustion/escalation), each closing a specific "declared in types/design but never wired" gap in `kernel.ts`. See §3.
 
 ---
 
@@ -21,7 +21,7 @@ Listed most authoritative first *for its own domain*. When they disagree, the di
 | Source | Is truth for | Notes |
 |---|---|---|
 | `src/`, `tests/`, `package.json`, `tsconfig.json` | **Implementation** — what exists and behaves | The repo is the only evidence of implementation status |
-| `tests/` (95 tests: 80 from the Slice 01 checklist, 9 executor/context regressions added after the real-model investigation below, 6 Slice 1.5 provider-translation tests) | **Executable behaviour** | A test asserts a contract. Changing a test changes the contract |
+| `tests/` (114 tests: 80 from the Slice 01 checklist, 9 executor/context regressions from the real-model investigation, 6 Slice 1.5 provider-translation tests, 19 Slice 2 kernel-lifecycle tests) | **Executable behaviour** | A test asserts a contract. Changing a test changes the contract |
 | `design/01`–`design/09`, `APPENDIX-A` | **Architecture** | Design notes reflect all applied amendments |
 | `design/AMENDMENTS-pending.md` | **Which architectural decisions are applied vs deferred** | Authoritative record; 34 applied, 4 accepted-deferred, 0 outstanding |
 | `design/AMENDMENTS-E-architecture-close.md` | Full text of amendments E1–E4 (applied) | |
@@ -32,16 +32,16 @@ Design notes are large. **Reference them by section; do not paraphrase them into
 
 ---
 
-## 3. Current state (verified 2026-08-12)
+## 3. Current state (verified 2026-08-14)
 
-**Not a git repository.** `git rev-parse` fails at this path. `rental-intel/` *is* a separate git repository. Do not `git init` here without instruction.
+**This IS now a git repository**, established during Slice 1.5/2 work. `origin` → `https://github.com/houseofgorkha-source/ai-org-os`, branch `master`. `rental-intel/` remains a separate, unrelated git repository. `.gitignore` covers `node_modules/`, `.tmp/`, `.env*`, `.claude/settings.local.json`, OS cruft. §9 and §12 below are updated to match — do not treat their old "not a git repository" framing as current.
 
 ### Architecture — complete
 Design Notes 01–09 plus `APPENDIX-A-instrumentation.md`, `04a-memory-boundary.md`, `RECONCILIATION-01.md`, and both amendment ledgers. Amendment pass executed: **34 applied, 4 accepted-deferred, 0 outstanding.**
 
 ### Slice 01 — implemented, all tests passing
 ```
-typecheck: PASS       95 tests, 95 pass, 0 fail   (80 from the checklist; 15 added since — see below)
+typecheck: PASS       114 tests, 114 pass, 0 fail   (80 from the checklist; 34 added since — see below and §3a)
 ```
 
 ### Source tree — `src/`, 18 modules, zero runtime dependencies
@@ -58,7 +58,10 @@ broker.ts            ToolBroker (denial path), ModelBroker (metering), tokens
 executor.ts          agent loop + scriptedProvider/failingProvider
 harvest.ts           freeze, kernel-side diff, scope surfacing, artifact dedupe
 gates.ts             7 gate implementations, ordering, quorum, short-circuit
-kernel.ts            state machine, leases, admission, budget, recovery sweeps
+kernel.ts            state machine, leases, admission, budget, recovery sweeps,
+                        dependency graph + blocked propagation, plan-status
+                        aggregation, C12 approval enforcement, escalation
+                        records, attempt retry/exhaustion/escalation (Slice 2)
 replay.ts            modes 1 (audit) and 2 (context)
 instrument.ts        Appendix A measures + DisagreementSampler
 slice01.ts           the slice's configuration and test world
@@ -71,7 +74,19 @@ harness.ts           Slice 1.5 single-real-attempt runner, NOT wired into npm te
 Registries with signing and mandatory negative fixtures · predicate language + coverage · deterministic validation · spec resolution with intersect/union/min · resolver seam · leases with epoch fencing · pessimistic budget reservation · spend-point metering · capability tokens · tool broker with structured denial path and denial budget · model broker with fallback recording · executor loop · kernel-side harvest with out-of-scope surfacing · 7 gates with 4-valued verdicts, stage ordering, cheap-gate batching, expensive short-circuit, 3/3 quorum · FailureRecord whitelist + retry · quorum approvals bound to content hash · event log + causation · replay modes 1 and 2 · crash-recovery sweeps · Appendix A measures · **(Slice 1.5, see below) a real Anthropic model provider, validated against a real API call.**
 
 ### Not implemented (verified absent from `src/`)
-No `MemoryProposal` · no `ArchitectureDecision` or constraint compilation · no `model_judged` gate (the enum value exists; no gate uses it) · no `neighbourhood` context layer · no `RankSpec` · no `PrincipalAttentionBudget` · no `memory_policy` · no multi-node DAG execution · no class promotion evaluation at runtime. (A real model provider *is* now implemented — see Slice 1.5, below — but it is not part of Slice 01's own scope or its 80 scripted-provider tests.)
+No `MemoryProposal` · no `ArchitectureDecision` or constraint compilation · no `model_judged` gate (the enum value exists; no gate uses it) · no `neighbourhood` context layer · no `RankSpec` · no `PrincipalAttentionBudget` · no `memory_policy` · no class promotion evaluation at runtime · no `reject()`/`cancel()` (human-actor `WorkUnitStatus` transitions `rejected`/`cancelled` are typed, never constructed) · no `WorkUnit.inputs[].contentHash` artifact-input pinning (`inputs: []` always) · no plan-level driver/scheduler (retry and multi-node dispatch remain caller-driven — see §3a). (A real model provider *is* implemented — Slice 1.5 — and multi-node dependency scheduling, plan aggregation, and escalation records *are* now implemented — Slice 2, §3a — but none of this is part of Slice 01's own 80-test checklist scope.)
+
+### §3a. Slice 2 — kernel lifecycle completion (in progress, verified 2026-08-14)
+
+Not a new architecture, not a new slice *proposal* document — five bounded increments, each closing a specific "declared in `types.ts`/design, never wired in `kernel.ts`" gap, discovered by auditing the call graph rather than assuming a definition being present meant it was used. All on `master`, commits `1b3d860`…`874c035`. Each increment: `src/kernel.ts` (+ narrowly `src/types.ts` once) and its own tests only — no new Role, no C2 gate, no scheduler, no design-doc changes (all are implementations of already-specified behavior, not new decisions).
+
+1. **Dependency graph runtime** (`1b3d860`) — `materialise()` populates `WorkUnit.dependsOn` from authored `artifact`/`ordering` plan edges; `admit()` defers on unmet dependencies and transitions `validated → blocked` when an upstream dependency fails. `blocked` propagates transitively through chains (a fix landed one slice later, `59a712d`, after the plan-aggregation audit surfaced it — `blocked` was originally missing from the terminal-failure classification `admit()` uses).
+2. **Plan-level status aggregation** (`59a712d`) — `approved → running → complete/partial` (design/06 §2.4), a kernel-owned projection keyed `plan.id@plan.version`, never mutating the input `TaskPlan`.
+3. **Pre-dispatch approval enforcement** (`bafab45`) — `admit()` now actually calls the C12 validator (`validate.ts`'s `validateDispatchApprovals`, previously only exercised by tests directly).
+4. **Escalation lifecycle records** (`ead459c`) — a real `Escalation` object (`id, unitId, klass, raisedAt, resolvedAt, resolution`) and `resolveEscalation()`, recording the escalation paths that already existed (`capability_denied`, `indeterminate`) rather than only emitting a bare event.
+5. **Attempt retry/exhaustion/escalation** (`874c035`) — `admit()` now makes the `attempt_failed → ready | exhausted → escalated | escalated` decision (design/06 §2.1), using the pre-existing `canRetry()`/`noProgress()` (previously correct but never called by the kernel itself). **Deliberately preserved, not changed:** `attempt_failed` is never auto-promoted at failure time — `postExecution` still just sets it and stops; the decision fires only when `admit()` is next called on that unit. This is load-bearing (`T-F10`, `T-F13` assert `attempt_failed` persists through one failed attempt with no `admit()` call) and confirms retry is **caller-driven**, not kernel-automatic — nothing in `kernel.ts` launches a second attempt by itself, anywhere.
+
+**Evidence trail worth knowing about before touching this area again:** two multi-turn audits preceded implementation for the DAG and retry slices specifically, each surfacing a real behavioral gap between what the proposed plan assumed and what the call graph actually did (the `blocked`-propagation gap; the `attempt_failed`-timing constraint). Re-derive from the repository, don't assume the shape of the *next* gap matches these.
 
 ### Slice 1.5 — real-model validation harness (verified 2026-08-13)
 
@@ -134,7 +149,7 @@ Do not violate these. Each is enforced by code **and** by a test. Read the refer
 
 **One test is weaker than it looks.** `T-F3` asserts the denial path produces adaptation — but the scripted model adapts *because it was scripted to*. Note 07 §7's claim that a legible refusal produces adaptation rather than a loop is an empirical claim about real model behaviour and is currently unverified.
 
-**Deliberately not implemented in Slice 01** (per `SLICE-01-acceptance-checklist.md` §O): architect Role and constraint compilation · any C2 criterion or model verifier · planner Role · multi-node DAG and artifact edges · class promotion rules · Memory beyond the zero-record case · non-trivial instance policy composition · escalation flow and attention policy · quorum > 1 in practice · `approve_with_conditions` · budget-increase approval · fleet layer · `RankSpec` · scheduling priority · `constraint_cases` in the eval suite.
+**Deliberately not implemented in Slice 01's own checklist scope** (per `SLICE-01-acceptance-checklist.md` §O, still true of the 80 checklist tests themselves): architect Role and constraint compilation · any C2 criterion or model verifier · planner Role · multi-node DAG and artifact edges · class promotion rules · Memory beyond the zero-record case · non-trivial instance policy composition · escalation flow and attention policy · quorum > 1 in practice · `approve_with_conditions` · budget-increase approval · fleet layer · `RankSpec` · scheduling priority · `constraint_cases` in the eval suite. **Two of these — multi-node DAG/dependency edges, and escalation flow — are now implemented at the kernel level as Slice 2 (§3a).** Slice 01's own plan/tests remain single-node and don't exercise them; this is Slice 2 extending the kernel underneath Slice 01, not a change to Slice 01's contract.
 
 ---
 
@@ -197,8 +212,8 @@ node --test --experimental-strip-types "tests/jklm-approval-replay-budget.test.t
 
 ## 9. Repository safety
 
-- **AI-Org OS lives in `C:\Projects\ai-org-os`.** It is currently **not** a git repository.
-- **RentalIntel lives in `C:\Projects\rental-intel` and IS a separate git repository** (`rental-intel`).
+- **AI-Org OS lives in `C:\Projects\ai-org-os`.** It **is** a git repository (`origin` → `github.com/houseofgorkha-source/ai-org-os`, branch `master`) — see §3.
+- **RentalIntel lives in `C:\Projects\rental-intel` and IS a separate, unrelated git repository** (`rental-intel`).
 - **Never move AI-Org OS code into RentalIntel, or the reverse.**
 - **Never modify RentalIntel unless explicitly instructed.**
 - AI-Org OS has **zero runtime dependencies**; devDependencies are `typescript` and `@types/node` only. It shares nothing with RentalIntel. **Do not assume a shared skill, tool, or dependency — verify and name it before relying on it.**
@@ -208,7 +223,7 @@ node --test --experimental-strip-types "tests/jklm-approval-replay-budget.test.t
 ## 10. Session start protocol
 
 1. Read this file.
-2. Check repository state (`git status` will fail here — that is expected, see §9).
+2. Check repository state: `git status`, `git log --oneline -5` — this is a real git repository now (§3, §9). A dirty or ahead-of-origin working tree from a prior session is a finding, not an error.
 3. Read the source and tests for the area in question. **Do not work from memory of prior sessions.**
 4. Identify the current task and check §3 for what is already done — **do not redo completed work**.
 5. **State the intended change before making a large one**, and name which invariant (§4) it touches, if any.
@@ -218,7 +233,9 @@ node --test --experimental-strip-types "tests/jklm-approval-replay-budget.test.t
 
 ## 11. Current next step
 
-There is no standing "next step" recorded here. The next implementation task must be determined at session start from the current repository state (§3), the test suite, the design corpus (`design/`, the amendment ledgers, `SLICE-01-acceptance-checklist.md`), and explicit user direction — **never from an undocumented prior conversation**. If a prior session agreed on a direction that matters going forward, it belongs in an ADR, a ledger entry, or code — not in this file. Treat the absence of a recorded next step as a prompt to ask the user or re-derive it from the repository, not as license to invent one.
+There is no standing "next step" recorded here. The next implementation task must be determined at session start from the current repository state (§3, §3a), the test suite, the design corpus (`design/`, the amendment ledgers, `SLICE-01-acceptance-checklist.md`), and explicit user direction — **never from an undocumented prior conversation**. If a prior session agreed on a direction that matters going forward, it belongs in an ADR, a ledger entry, or code — not in this file. Treat the absence of a recorded next step as a prompt to ask the user or re-derive it from the repository, not as license to invent one.
+
+Slice 2 (§3a) established a working pattern for this kind of gap: grep for a status/field/type declared but never constructed or called, verify the call graph (not just the definition) before assuming a proposed fix's shape is correct, wire it into the smallest existing entry point rather than adding new machinery, and re-run the full suite before *and* after to catch load-bearing assumptions the audit alone might miss. That's a precedent, not a queue — the actual next gap still has to be re-derived, not assumed to be next in some list.
 
 ---
 
@@ -234,5 +251,5 @@ Without explicit instruction, do **not**:
 6. Replace a deterministic mechanism with LLM reasoning. The kernel contains no model call, and validation, resolution, harvest, and gate routing must stay deterministic.
 7. Weaken a security boundary: executor credentials, network egress, capability scoping, the closed gate-context enumeration, or private-segment reachability.
 8. Modify `rental-intel/`.
-9. `git init` this repository, or commit, without being asked.
+9. Commit, push, force-push, or rewrite history without being asked — even though this is now an established git repository (§3, §9), each of those remains an explicit-instruction-only action.
 10. Edit a test to make a failing build green.
