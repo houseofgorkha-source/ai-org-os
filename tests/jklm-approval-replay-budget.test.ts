@@ -298,7 +298,7 @@ test('T-K6 [S10, REQUIRED] crash after executor exit, before harvest, loses noth
   assert.equal(after.artifacts.length, 1, 'exactly ONE artifact — no duplicate');
   assert.equal(w.ledger.total(), spendBefore, 'zero additional model spend on recovery');
   assert.equal(after.status, 'awaiting_approval', 'unit proceeded through gates normally');
-  assert.ok(after.gateResults.length === 6, 'all six gates ran after recovery');
+  assert.ok(after.gateResults.length === 7, 'all seven gates ran after recovery');
   assert.ok(w.events.byType('recovery.harvest_resumed').length === 1);
 
   // Harvest is deterministic: a third harvest yields the identical content hash.
@@ -438,6 +438,70 @@ test('T-L6 instance spend accumulates across units and constrains admission', ()
   assert.equal(w.kernel.expect(u3.id).status, 'validated', 'a refused admission is not a transition');
 });
 
+test('T-L7 account.spent is exact across a retried unit and a second unit; release never double-counts or erases prior spend', () => {
+  // Regression for the confirmed account.spent accounting defect found on the
+  // live 2-node harness run: releaseReservation() summed ledger spend over
+  // ALL of a unit's attempts on EVERY call. A unit that fails once and
+  // retries calls releaseReservation() twice (attempt_failed releases and
+  // re-reserves for the retry) — the first call correctly added attempt 1's
+  // spend alone, but the second call re-summed attempts [1, 2] and added
+  // attempt 1's spend a second time. T-L6 could not catch this: every unit
+  // there succeeds on its first attempt, so releaseReservation() only ever
+  // fires once per unit and `sum-of-all-attempts` and `this-attempt-only`
+  // are indistinguishable. This unit deliberately retries.
+  const w = makeWorld({ script: DEFAULT_SCRIPT });
+  const base = w.plan.nodes[0]!;
+  const plan = { ...w.plan, nodes: [base, { ...base, nodeId: 'n2' }] };
+
+  // Unit 1: DEFAULT_SCRIPT fails for real on attempt 1 (a genuine gate
+  // failure, not simulated) and succeeds on attempt 2.
+  const u1 = w.kernel.materialise(plan, plan.nodes[0]!, w.baseline);
+  w.kernel.acquireLease(u1.id, 's1');
+  const a1a = w.kernel.runAttempt(u1.id, DEFAULT_SCRIPT);
+  assert.equal(w.kernel.expect(u1.id).status, 'attempt_failed', 'attempt 1 genuinely fails, releasing and re-reserving on retry');
+  const a1b = w.kernel.runAttempt(u1.id, DEFAULT_SCRIPT);
+  assert.equal(w.kernel.expect(u1.id).status, 'awaiting_approval', 'attempt 2 succeeds');
+  const X = w.ledger.spentFor(a1a.attempt.id) + w.ledger.spentFor(a1b.attempt.id);
+  assert.ok(X > 0, 'unit 1 spent something real across both attempts');
+  assert.equal(w.kernel.account.spent, X, 'unit 1 alone: account.spent is the TRUE total across both its attempts, not double-counted');
+
+  // Unit 2: same world, so the same script — it also fails attempt 1 and
+  // succeeds on attempt 2. (The world's provider is fixed at makeWorld() by
+  // its `script` option; the `script` argument to runAttempt() itself is not
+  // consulted for a scripted provider, so both units necessarily share it —
+  // this is also why the fix must hold for EVERY retried unit, not just one.)
+  const u2 = w.kernel.materialise(plan, plan.nodes[1]!, w.baseline);
+  w.kernel.acquireLease(u2.id, 's2');
+  const a2a = w.kernel.runAttempt(u2.id, DEFAULT_SCRIPT);
+  assert.equal(w.kernel.expect(u2.id).status, 'attempt_failed', 'unit 2 also fails attempt 1 for real');
+  const a2b = w.kernel.runAttempt(u2.id, DEFAULT_SCRIPT);
+  assert.equal(w.kernel.expect(u2.id).status, 'awaiting_approval', 'unit 2 succeeds on attempt 2');
+  const Y = w.ledger.spentFor(a2a.attempt.id) + w.ledger.spentFor(a2b.attempt.id);
+  assert.ok(Y > 0, 'unit 2 spent something real across both its attempts');
+
+  assert.equal(w.kernel.account.spent, X + Y, 'account.spent is the sum across both units — unit 2 did not erase unit 1\'s contribution');
+
+  // Idempotency: force unit 1's reservation positive again, exactly as a
+  // stale-reservation sweep would find it after a crash (same coercion T-L3
+  // uses), and release it a second time. Every attempt on unit 1 is already
+  // reconciled, so this MUST add zero further spend and must not erase what
+  // is already recorded.
+  const st1 = w.kernel.expect(u1.id);
+  st1.status = 'cancelled';
+  st1.reserved = 5;
+  w.kernel.account.reserved += 5;
+  const totalBeforeResweep = w.kernel.account.spent;
+  assert.equal(w.kernel.sweepStaleReservations(), 1, 'the artificially-reserved unit is found and released');
+  assert.equal(w.kernel.account.spent, totalBeforeResweep, 'a second release of an already-reconciled unit adds ZERO spend');
+  assert.equal(w.kernel.account.spent, X + Y, 'and prior spend is neither erased nor altered');
+  assert.equal(st1.reserved, 0, 'the reservation is still released');
+
+  // Repeat once more directly, with no intervening reservation: release must
+  // be a true no-op, not merely "no-op the first extra time".
+  assert.equal(w.kernel.sweepStaleReservations(), 0, 'nothing left to sweep — reserved is already 0');
+  assert.equal(w.kernel.account.spent, X + Y, 'idempotent: unchanged on a call with nothing to release');
+});
+
 // ==================================================== M. Instrumentation
 
 test('T-M1..M6 all tier-1 measures are non-null from unit zero', () => {
@@ -458,10 +522,10 @@ test('T-M1..M6 all tier-1 measures are non-null from unit zero', () => {
   });
 
   assert.ok(m.m1_costPerAcceptedChange['mechanical_change']! > 0, 'M1');
-  assert.equal(Object.keys(m.m2_gateCatchAndCost).length, 6, 'M2 covers every gate that ran');
+  assert.equal(Object.keys(m.m2_gateCatchAndCost).length, 7, 'M2 covers every gate that ran');
   assert.equal(m.m2_gateCatchAndCost['tests.affected_pass@1.0.0']!.catches, 1, 'M2 catch recorded');
   assert.equal(m.m2_gateCatchAndCost['deps.unchanged@1.0.0']!.catches, 0, 'zero-catch is a BASELINE, not a verdict');
-  assert.equal(Object.keys(m.m3_indeterminateRate).length, 6, 'M3');
+  assert.equal(Object.keys(m.m3_indeterminateRate).length, 7, 'M3');
   assert.equal(m.m3_indeterminateRate['tests.affected_pass@1.0.0'], 0, 'M3 is 0 on slice 01');
   assert.equal(m.m4_verifierDisagreement.samples, 2, 'M4 samples PASSES only');
   assert.equal(m.m4_verifierDisagreement.rate, 0.5, 'M4');

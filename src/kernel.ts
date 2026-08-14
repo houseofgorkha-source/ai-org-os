@@ -64,6 +64,8 @@ export interface UnitState {
   progressHashes: string[];
   /** Real DenialRecords from each attempt's ToolBroker, keyed by attemptId — Note 07 §7. */
   denialsByAttempt: Map<string, DenialRecord[]>;
+  /** AttemptIds already folded into `account.spent` — releaseReservation() must never re-add one (Note 06 §7). */
+  reconciledAttempts: Set<string>;
 }
 
 export interface Faults {
@@ -155,7 +157,7 @@ export class Kernel {
     this.units.set(unit.id, {
       unit, status: 'validated', attempts: [], lease: null, epoch: 0, reserved: 0,
       failures: [], gateResults: [], artifacts: [], manifests: [], progressHashes: [],
-      denialsByAttempt: new Map(),
+      denialsByAttempt: new Map(), reconciledAttempts: new Set(),
     });
     this.emit('workunit.validated', [unit.id], { planNodeId: node.nodeId }, null, plan.intentRef);
     return unit;
@@ -653,13 +655,22 @@ export class Kernel {
   private releaseReservation(st: UnitState): void {
     if (st.reserved <= 0) return;
     this.account.reserved -= st.reserved;
-    const actual = st.attempts.reduce((a, at) => a + this.d.ledger.spentFor(at.id), 0);
     // Note 06 §7: `instance_spent += actual`. The account is instance-scoped
     // (its cap is `perDayCap`), so a unit's terminal reconciliation ADDS its
     // spend; assigning would erase every prior unit's, and `admit()`'s
     // headroom check reads this field — under-counting there is an overspend,
-    // the one direction `fail_closed` forbids. Each unit contributes exactly
-    // once: the `st.reserved <= 0` guard above plus the zeroing below.
+    // the one direction `fail_closed` forbids.
+    //
+    // `actual` must be summed only over attempts NOT already folded into
+    // `account.spent` — a retried unit calls releaseReservation() once per
+    // attempt (attempt_failed releases and re-reserves on retry), so summing
+    // st.attempts unconditionally re-adds every prior attempt's spend on
+    // each subsequent release, over-counting the account by their sum. The
+    // `reconciledAttempts` set makes each attempt contribute exactly once,
+    // independent of how many times release fires for this unit.
+    const unreconciled = st.attempts.filter((at) => !st.reconciledAttempts.has(at.id));
+    const actual = unreconciled.reduce((a, at) => a + this.d.ledger.spentFor(at.id), 0);
+    for (const at of unreconciled) st.reconciledAttempts.add(at.id);
     this.account.spent += actual;
     this.emit('budget.released', [st.unit.id], { released: st.reserved, actual });
     st.reserved = 0;
