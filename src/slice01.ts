@@ -292,6 +292,9 @@ export function buildRegistry(): Registry {
     'Example — write a file:',
     'CALL fs.write workspace://src/app.js {"path":"src/app.js","content":"...new file contents..."}',
     '',
+    'Example — create a file that does not exist yet (it will not appear in any file listing until you write it):',
+    'CALL fs.write workspace://src/util.js {"path":"src/util.js","content":"...new file contents..."}',
+    '',
     'Use only the tools and scopes granted to you.',
     '',
     'Rules:',
@@ -299,6 +302,7 @@ export function buildRegistry(): Registry {
     '2. The JSON arguments object must be valid JSON and must remain entirely on that same line.',
     '3. After reading files, continue working toward the objective. Reading alone does not complete the task.',
     '4. Never emit DONE until the stated objective has actually been completed.',
+    '5. Planning, describing, or reasoning about a change is NOT the same as making it. If the objective requires creating, modifying, or deleting a file, you must actually issue the corresponding fs.write (or other tool) CALL. DONE is only valid after that CALL has actually been executed — never on the basis of having explained what the change would be.',
     '',
     'When you are finished, emit a line containing only:',
     'DONE',
@@ -357,7 +361,17 @@ export function layerSources(registry: Registry): Map<string, LayerSource> {
   m.set('target_files', {
     gather: (u, ctx) => {
       const files = ctx.listFiles().filter((f) => f.startsWith('src/'));
-      const body = files.map((f) => `--- ${f}\n${ctx.readFile(f) ?? ''}`).join('\n');
+      const listed = files.map((f) => `--- ${f}\n${ctx.readFile(f) ?? ''}`).join('\n');
+      // Deterministic, always-true clarification (not objective-dependent
+      // NLP guessing): this layer can only ever list files that already
+      // exist, since it is built from the repository's tracked-file list.
+      // A new-file objective's target therefore never appears here — that
+      // absence must not read as "nothing to do."
+      const note = 'Only files that already exist in the repository are listed above. '
+        + 'If the objective requires a NEW file, it will NOT appear here — create it '
+        + 'directly with fs.write at the path the objective names; do not wait for it '
+        + 'to show up in this list first.';
+      const body = `${listed}\n\n${note}`;
       return { body, provenance: `repo@${ctx.headCommit.slice(0, 7)}`, sourceVersion: ctx.headCommit, units: body.split('\n').length };
     },
   });

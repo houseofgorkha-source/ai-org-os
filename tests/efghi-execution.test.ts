@@ -137,6 +137,56 @@ test('T-E7 the resolved Role prompt is rendered into the compiled context, not a
   assert.ok(manifest.layers.some((l) => l.name === 'role_prompt'), 'the manifest — the record of what the model saw — captures the prompt layer');
 });
 
+// T-E8/9/10: regression for the aios-2node-eU2kKu/4ehEgx forensic finding —
+// n2's rendered context gave the model no visible reason to call a tool for
+// a NEW file (target_files can only ever list files that already exist) and
+// the prompt's DONE guard only ruled out "reading is enough," never
+// "describing is enough." Both gaps are closed additively; the pre-existing
+// DONE/read guard (T-E6) and read-then-write workflow (T-F9) must survive.
+
+test('T-E8 the implementer prompt explicitly requires actual tool execution, not merely describing the change', () => {
+  const w = makeWorld({ script: FIXING_SCRIPT });
+  const prompt = w.registry.getPrompt('implementer@1.0.0');
+  assert.ok(prompt.includes('Planning, describing, or reasoning about a change is NOT the same as making it.'), 'explicit tool-execution requirement present');
+  assert.ok(prompt.includes('you must actually issue the corresponding fs.write (or other tool) CALL'), 'explicit imperative to call a tool');
+  assert.ok(prompt.includes('DONE is only valid after that CALL has actually been executed'), 'DONE gated on actual execution, not description');
+  assert.ok(prompt.includes('CALL fs.write workspace://src/util.js {"path":"src/util.js","content":"...new file contents..."}'), 'a worked example for creating a NEW file is present');
+  // The pre-existing DONE/read guard (T-E6) must remain, byte-for-byte —
+  // this is an ADDITIVE clarification, not a replacement.
+  assert.ok(prompt.includes('Never emit DONE until the stated objective has actually been completed.'), 'existing rule 4 unchanged');
+  assert.ok(prompt.includes('After reading files, continue working toward the objective. Reading alone does not complete the task.'), 'existing rule 3 unchanged');
+});
+
+test('T-E9 a new-file objective receives actionable context: target_files explains an absent file must still be created', () => {
+  const w = makeWorld({ script: FIXING_SCRIPT });
+  const newFileNode = { ...n(w), nodeId: 'n2', objective: 'Add a new file src/util.js that exports a function double(x) returning x * 2.' };
+  const plan = { ...w.plan, nodes: [n(w), newFileNode] };
+  const u = w.kernel.materialise(plan, newFileNode, w.baseline);
+  const ctx: GatherContext = {
+    repoRoot: w.repoRoot, headCommit: w.baseline, memory: w.memory, priorFailure: null,
+    readFile: (rel) => { try { return readFileSync(join(w.repoRoot, rel), 'utf8'); } catch { return null; } },
+    listFiles: () => git(w.repoRoot, ['ls-files']).trim().split('\n'),
+  };
+  const { rendered } = new ContextCompiler(layerSources(w.registry)).compile(u, RECIPE, ctx);
+  // Control: the listing format itself (`--- <path>`) never fabricates an
+  // entry for the new file — it genuinely doesn't exist yet. (The objective
+  // block legitimately mentions "src/util.js" in prose, so the check is
+  // scoped to the listing marker, not the whole rendered prompt.)
+  assert.ok(!rendered.includes('--- src/util.js'), 'control: the new file is not fabricated into the target_files listing');
+  assert.ok(rendered.includes('If the objective requires a NEW file, it will NOT appear here'), 'the model is told an absent file is not "nothing to do"');
+  assert.ok(rendered.includes('create it directly with fs.write at the path the objective names'), 'actionable instruction for the new-file case is present');
+});
+
+test('T-E10 the n1-style existing-file modification workflow still passes unchanged', () => {
+  // Same canonical READ -> WRITE -> DONE sequence as T-F9, re-asserted here
+  // because it exercises the exact prompt/target_files layers just changed —
+  // proves the additions did not weaken the workflow they were meant to leave alone.
+  const { st } = run(FIXING_SCRIPT);
+  assert.equal(st.status, 'awaiting_approval', 'the prompt/context additions do not weaken the existing successful workflow');
+  assert.equal(st.gateResults.filter((r) => r.verdict === 'fail').length, 0, 'every gate still passes');
+  assert.ok(st.artifacts[0]!.segments.find((s) => s.name === 'files_touched'));
+});
+
 // ========================================================== F. Execution
 
 test('T-F1 a token from another attempt is refused', () => {
@@ -640,6 +690,42 @@ test('T-I7 admit() allows a retry through when attempts remain and on_failure sa
   const st = w.kernel.expect(u.id);
   assert.equal(st.status, 'awaiting_approval', 'the retry, gated through admit(), completed successfully in the ordinary way');
   assert.equal(w.kernel.escalations.filter((e) => e.unitId === u.id).length, 0, 'a legitimate retry never escalates');
+});
+
+test('T-I7b a retry reuses the ORIGINAL lease; re-acquiring is correctly rejected, not required', () => {
+  // Regression for the harness-2node.ts bug this locks the contract against:
+  // the driver called acquireLease() a SECOND time before the retry attempt,
+  // which kernel.ts's compare-and-set (`st.lease && !expired -> return null`)
+  // correctly refused — the lease is session-scoped, not per-attempt, and
+  // T-I7 already proves a retry needs no second lease at all. This test
+  // additionally proves the REJECTION itself is correct (not merely that
+  // omitting the second call happens to work), then proves the retry still
+  // reaches awaiting_approval using only the original lease.
+  const w = makeWorld({ script: DEFAULT_SCRIPT });
+  const u = w.kernel.materialise(w.plan, n(w), w.baseline);
+
+  const lease1 = w.kernel.acquireLease(u.id, 's1');
+  assert.ok(lease1, 'one lease is acquired before attempt 1');
+
+  w.kernel.runAttempt(u.id, DEFAULT_SCRIPT);
+  assert.equal(w.kernel.expect(u.id).status, 'attempt_failed', 'attempt 1 fails for real');
+
+  const retryAdmit = w.kernel.admit(u.id);
+  assert.equal(retryAdmit.admitted, true, 'admit() allows the retry');
+  assert.equal(w.kernel.expect(u.id).status, 'ready');
+
+  // The original lease is still valid (leaseTtlS default is well beyond
+  // instant test execution) — a second acquisition attempt MUST be refused.
+  const reacquireAttempt = w.kernel.acquireLease(u.id, 's1');
+  assert.equal(reacquireAttempt, null, 'a second acquireLease() while the original is still valid is correctly rejected');
+  assert.equal(w.kernel.expect(u.id).lease!.epoch, lease1!.epoch, 'the rejected call left the original lease/epoch untouched');
+
+  // The retry itself needs no lease re-acquisition — it runs directly under
+  // the lease from before attempt 1.
+  w.kernel.runAttempt(u.id, DEFAULT_SCRIPT);
+  const st = w.kernel.expect(u.id);
+  assert.equal(st.status, 'awaiting_approval', 'the retry reaches awaiting_approval using the existing lease, never a new one');
+  assert.equal(st.lease!.epoch, lease1!.epoch, 'still the same lease/epoch throughout both attempts');
 });
 
 test('T-I8 attempts exhausted (genuinely distinct failures, no progress-collapse) escalate through admit(), reusing the Escalation record', () => {
