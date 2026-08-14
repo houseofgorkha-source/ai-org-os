@@ -657,6 +657,58 @@ export class Kernel {
     return this.plans.get(`${planId}@${version}`)?.status;
   }
 
+  /**
+   * `approved | running -> cancelled`, human, direct call (design/06 §2.1
+   * line 76's "any non-terminal -> cancelled", specialised at plan level by
+   * §2.4 line 111's `running -> cancelled`; `approved` is included because
+   * the plan projection legitimately sits there between materialisation and
+   * first dispatch — nothing in this kernel ever registers a projection at
+   * `draft` (slice01.ts always authors `approved`), so `draft` is refused
+   * the same as any other non-{approved,running} status, not specially
+   * handled. The "kernel on parent-plan failure" half of that design line
+   * is a separate, unimplemented trigger — this is only the human path.
+   *
+   * Takes `planId` + `version` — same convention as planStatus() — rather
+   * than resolving a bare id to a "current" version. design/02 §8 names
+   * `superseded_by` as the intended forward-pointer for that resolution,
+   * but it is not a field on `TaskPlan` in types.ts (only `supersedes`
+   * exists, typed as a bare string, unresolved anywhere in this codebase,
+   * and exercised by zero tests). Inventing a resolution rule here would
+   * mean guessing at an architecture decision that has not actually been
+   * made; the caller supplying the version it already has avoids that.
+   *
+   * Cascades through the EXISTING cancel() unchanged, per member node.
+   * dependsOn edges are populated solely from this plan's own `edges`
+   * (materialise()), so every descendant of a cancelled unit is itself a
+   * member node of this same plan and gets cancelled directly in this same
+   * pass — no separate blocked-walk is needed or added. Already-terminal
+   * members (accepted, rejected, escalated, already cancelled) are left
+   * untouched because cancel() itself refuses them via CANCELLABLE_STATUSES,
+   * unmodified here.
+   *
+   * The projection is set to `cancelled` BEFORE the cascade so that each
+   * member cancel()'s own internal recomputePlanStatus() call sees an
+   * already-terminal plan and no-ops (idempotency guard fixed alongside
+   * this to include `cancelled`) rather than racing to compute
+   * complete/partial mid-cascade.
+   */
+  cancelPlan(planId: string, version: string, reason: string): { cancelled: boolean; reason?: string } {
+    const rec = this.plans.get(`${planId}@${version}`);
+    if (!rec) return { cancelled: false, reason: 'unknown plan' };
+    if (rec.status !== 'approved' && rec.status !== 'running') {
+      return { cancelled: false, reason: `status ${rec.status}` };
+    }
+    rec.status = 'cancelled';
+    for (const node of rec.plan.nodes) {
+      const nodeKey = `${rec.plan.id}@${rec.plan.version}#${node.nodeId}`;
+      const member = [...this.units.values()].find((u) => materialKey(u.unit) === nodeKey);
+      if (!member) continue;
+      if (CANCELLABLE_STATUSES.has(member.status)) this.cancel(member.unit.id, reason);
+    }
+    this.emit('plan.cancelled', [rec.plan.id], { version: rec.plan.version }, null, rec.plan.intentRef);
+    return { cancelled: true };
+  }
+
   /** `approved -> running`: "First node dispatched" — the first unit to actually reach `running`. */
   private markPlanRunning(unit: WorkUnit): void {
     const rec = this.plans.get(`${unit.planId}@${unit.planVersion}`);
@@ -674,7 +726,10 @@ export class Kernel {
    */
   private recomputePlanStatus(unit: WorkUnit): void {
     const rec = this.plans.get(`${unit.planId}@${unit.planVersion}`);
-    if (!rec || rec.status === 'complete' || rec.status === 'partial') return;
+    // `cancelled` is terminal same as complete/partial — added alongside
+    // cancelPlan() so a mid-cascade member cancel() (which calls this
+    // internally) can never overwrite a plan cancellation's own projection.
+    if (!rec || rec.status === 'complete' || rec.status === 'partial' || rec.status === 'cancelled') return;
 
     let allTerminal = true;
     let allAccepted = true;

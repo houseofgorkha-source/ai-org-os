@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { makeWorld, makePlan, POLICY, planHash, FIXING_SCRIPT, approvalFor } from '../src/slice01.ts';
+import { makeWorld, makePlan, POLICY, planHash, FIXING_SCRIPT, DEFAULT_SCRIPT, approvalFor } from '../src/slice01.ts';
 import { validatePlan, validateDispatchApprovals } from '../src/validate.ts';
 import type { ValidationEnv } from '../src/validate.ts';
 import type { TaskPlan, PlanNode } from '../src/types.ts';
@@ -530,4 +530,228 @@ test('T-D19 a plan containing a rejected or cancelled unit resolves to partial t
   assert.equal(w.kernel.cancel(u2.id, 'not proceeding').cancelled, true);
 
   assert.equal(w.kernel.planStatus(plan.id, plan.version), 'partial', 'one accepted, one cancelled — plan aggregation already classifies cancelled as terminal-non-accepted');
+});
+
+// --------------------------------------- Plan-level cancellation cascade
+// Phase 2 Slice 1. `cancelPlan(planId, version, reason)` — same planId+version
+// convention as planStatus(), a deliberate architectural decision: design/02
+// §8's `superseded_by` forward-pointer is not implemented in types.ts (only
+// `supersedes` exists, a bare unresolved string, exercised by zero tests
+// before T-P9 below), so there is no canonical "current version" resolver
+// anywhere in this codebase to reuse. Resolving a bare planId would mean
+// inventing that policy; requiring the caller's own version avoids it.
+// Reuses the existing per-unit cancel() unchanged, per member node — no new
+// dependency or aggregation logic. dependsOn edges never cross a plan
+// boundary (materialise() derives them solely from this plan's own `edges`),
+// so cancelling every non-terminal member directly also cancels every
+// descendant directly; there is no separate blocked-walk to prove.
+
+test('T-P1 cancelPlan() cancels a plan still in `approved` — before any node has dispatched', () => {
+  const w = makeWorld();
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1] };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'approved', 'nothing dispatched yet');
+
+  const r = w.kernel.cancelPlan(plan.id, plan.version, 'no longer needed');
+  assert.equal(r.cancelled, true, r.reason);
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'cancelled');
+  assert.equal(w.kernel.expect(u1.id).status, 'cancelled');
+  assert.equal(w.kernel.expect(u1.id).attempts.length, 0);
+
+  const evs = w.events.byType('plan.cancelled');
+  assert.equal(evs.length, 1);
+  assert.equal(evs[0]!.correlationId, plan.intentRef);
+  assert.equal((evs[0]!.payload as { version: string }).version, plan.version);
+});
+
+test('T-P2 cancelPlan() cancels a `running` plan and leaves already-terminal members untouched', () => {
+  const w = makeWorld({ script: FIXING_SCRIPT });
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const n3 = { ...node(w.plan), nodeId: 'n3' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1, n2, n3] }; // independent, no edges
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  const u2 = w.kernel.materialise(plan, n2, w.baseline);
+  const u3 = w.kernel.materialise(plan, n3, w.baseline);
+
+  // n1 driven to accepted (terminal success — must be untouched).
+  w.kernel.acquireLease(u1.id, 's1');
+  w.kernel.runAttempt(u1.id, FIXING_SCRIPT);
+  const st1 = w.kernel.expect(u1.id);
+  const art1 = st1.artifacts[st1.artifacts.length - 1]!;
+  w.kernel.recordApproval(approvalFor('merge', art1.id, art1.contentHash));
+  w.kernel.accept(u1.id, art1.id);
+  assert.equal(w.kernel.expect(u1.id).status, 'accepted');
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'running');
+
+  // n2 left untouched at awaiting_approval — n3 left untouched at validated.
+  w.kernel.acquireLease(u2.id, 's2');
+  w.kernel.runAttempt(u2.id, FIXING_SCRIPT);
+  assert.equal(w.kernel.expect(u2.id).status, 'awaiting_approval');
+  assert.equal(w.kernel.expect(u3.id).status, 'validated');
+
+  const r = w.kernel.cancelPlan(plan.id, plan.version, 'scope change');
+  assert.equal(r.cancelled, true, r.reason);
+
+  assert.equal(w.kernel.expect(u1.id).status, 'accepted', 'terminal success is never touched');
+  assert.equal(w.kernel.expect(u1.id).artifacts.find((a) => a.id === art1.id)!.status, 'accepted');
+
+  assert.equal(w.kernel.expect(u2.id).status, 'cancelled', 'awaiting_approval was cancellable');
+  const st2 = w.kernel.expect(u2.id);
+  assert.equal(st2.artifacts[st2.artifacts.length - 1]!.status, 'abandoned', 'cut short, never evaluated (Note 02 §13)');
+
+  assert.equal(w.kernel.expect(u3.id).status, 'cancelled', 'unstarted, validated -> cancelled');
+  assert.equal(w.kernel.expect(u3.id).attempts.length, 0);
+
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'cancelled');
+});
+
+test('T-P3 cancelPlan() cancels every descendant in a DAG chain directly, never through `blocked`', () => {
+  const w = makeWorld();
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const n3 = { ...node(w.plan), nodeId: 'n3' };
+  const plan: TaskPlan = {
+    ...w.plan, nodes: [n1, n2, n3],
+    edges: [{ from: 'n1', to: 'n2', kind: 'ordering' }, { from: 'n2', to: 'n3', kind: 'ordering' }],
+  };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  const u2 = w.kernel.materialise(plan, n2, w.baseline);
+  const u3 = w.kernel.materialise(plan, n3, w.baseline);
+
+  const r = w.kernel.cancelPlan(plan.id, plan.version, 'abandoning the chain');
+  assert.equal(r.cancelled, true, r.reason);
+
+  assert.equal(w.kernel.expect(u1.id).status, 'cancelled');
+  assert.equal(w.kernel.expect(u2.id).status, 'cancelled', 'descendant cancelled directly, not left blocked');
+  assert.equal(w.kernel.expect(u3.id).status, 'cancelled', 'transitive descendant cancelled directly too');
+  assert.equal(w.events.byType('workunit.blocked').length, 0, 'the blocked path was never exercised — plan membership already covers every descendant');
+  assert.equal(w.events.byType('workunit.cancelled').length, 3);
+});
+
+test('T-P4 recomputePlanStatus() treats `cancelled` as terminal: a member cancel()\'s internal recompute call cannot overwrite it', () => {
+  const w = makeWorld();
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1, n2] };
+  w.kernel.materialise(plan, n1, w.baseline);
+  w.kernel.materialise(plan, n2, w.baseline);
+
+  w.kernel.cancelPlan(plan.id, plan.version, 'no longer needed');
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'cancelled');
+
+  // Every terminal member here (both cancelled) would otherwise satisfy
+  // recomputePlanStatus's own "all terminal, none accepted" -> partial
+  // condition — proving the guard fix, not just the projection's first write.
+  assert.equal(w.events.byType('plan.partial').length, 0, 'the guard prevented a stray partial from a mid/post-cascade recompute');
+  assert.equal(w.events.byType('plan.cancelled').length, 1);
+});
+
+test('T-P5 repeated cancelPlan() is idempotent: a second call is refused, not re-applied', () => {
+  const w = makeWorld();
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1] };
+  w.kernel.materialise(plan, n1, w.baseline);
+
+  assert.equal(w.kernel.cancelPlan(plan.id, plan.version, 'first').cancelled, true);
+  const second = w.kernel.cancelPlan(plan.id, plan.version, 'second');
+  assert.equal(second.cancelled, false, 'already cancelled — refused, not re-applied');
+  assert.equal(second.reason, 'status cancelled');
+  assert.equal(w.events.byType('plan.cancelled').length, 1, 'no duplicate event');
+});
+
+test('T-P6 cancelPlan() refuses an already-`complete` or `partial` plan', () => {
+  const w1 = makeWorld({ script: FIXING_SCRIPT });
+  const n1 = { ...node(w1.plan), nodeId: 'n1' };
+  const completePlan: TaskPlan = { ...w1.plan, nodes: [n1] };
+  const u1 = w1.kernel.materialise(completePlan, n1, w1.baseline);
+  w1.kernel.acquireLease(u1.id, 's1');
+  w1.kernel.runAttempt(u1.id, FIXING_SCRIPT);
+  const st1 = w1.kernel.expect(u1.id);
+  const art1 = st1.artifacts[st1.artifacts.length - 1]!;
+  w1.kernel.recordApproval(approvalFor('merge', art1.id, art1.contentHash));
+  w1.kernel.accept(u1.id, art1.id);
+  assert.equal(w1.kernel.planStatus(completePlan.id, completePlan.version), 'complete');
+
+  const rComplete = w1.kernel.cancelPlan(completePlan.id, completePlan.version, 'too late');
+  assert.equal(rComplete.cancelled, false);
+  assert.equal(rComplete.reason, 'status complete');
+  assert.equal(w1.kernel.expect(u1.id).status, 'accepted', 'untouched');
+
+  // Drives to `partial` the same way T-D11 does: a real terminal-failure
+  // transition (denial-budget escalation), whose own postExecution call
+  // triggers recomputePlanStatus — not a direct status assignment.
+  const spam = (_p: string, t: number): string => (t <= 6 ? 'CALL net.fetch https://x.invalid/a {"path":"a"}' : 'DONE');
+  const w2 = makeWorld({ script: spam });
+  const p1 = { ...node(w2.plan), nodeId: 'n1' };
+  const partialPlan: TaskPlan = { ...w2.plan, nodes: [p1] };
+  const v1 = w2.kernel.materialise(partialPlan, p1, w2.baseline);
+  w2.kernel.acquireLease(v1.id, 's1');
+  w2.kernel.runAttempt(v1.id, spam);
+  assert.equal(w2.kernel.expect(v1.id).status, 'escalated');
+  assert.equal(w2.kernel.planStatus(partialPlan.id, partialPlan.version), 'partial');
+
+  const rPartial = w2.kernel.cancelPlan(partialPlan.id, partialPlan.version, 'too late');
+  assert.equal(rPartial.cancelled, false);
+  assert.equal(rPartial.reason, 'status partial');
+});
+
+test('T-P7 cancelPlan() on an unknown plan+version is refused, not thrown', () => {
+  const w = makeWorld();
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1] };
+  w.kernel.materialise(plan, n1, w.baseline);
+
+  const wrongId = w.kernel.cancelPlan('plan_does_not_exist', plan.version, 'n/a');
+  assert.equal(wrongId.cancelled, false);
+  assert.equal(wrongId.reason, 'unknown plan');
+
+  const wrongVersion = w.kernel.cancelPlan(plan.id, '9.9.9', 'n/a');
+  assert.equal(wrongVersion.cancelled, false);
+  assert.equal(wrongVersion.reason, 'unknown plan', 'a real id with the wrong version is exactly as unknown as a nonexistent id');
+});
+
+test('T-P8 cancelPlan() never mutates a prior terminal Attempt', () => {
+  const w = makeWorld({ script: DEFAULT_SCRIPT });
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1] };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  w.kernel.acquireLease(u1.id, 's1');
+  w.kernel.runAttempt(u1.id, DEFAULT_SCRIPT);
+  const before = w.kernel.expect(u1.id);
+  assert.equal(before.status, 'attempt_failed');
+  const attemptBefore = JSON.stringify(before.attempts[0]);
+
+  const r = w.kernel.cancelPlan(plan.id, plan.version, 'abandoning this unit');
+  assert.equal(r.cancelled, true, r.reason);
+  const after = w.kernel.expect(u1.id);
+  assert.equal(after.status, 'cancelled');
+  assert.equal(JSON.stringify(after.attempts[0]), attemptBefore, 'the prior terminal Attempt is immutable (Note 06 §2.2)');
+});
+
+test('T-P9 version isolation: cancelling one version of a planId never touches a second version sharing that id', () => {
+  // Two TaskPlan objects, same `id`, different `version` — no fixture
+  // restriction blocks this: materialise() keys its plan projection on
+  // `${plan.id}@${plan.version}` and has no uniqueness check on `id` alone.
+  const w = makeWorld();
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const planV1: TaskPlan = { ...w.plan, id: 'plan_shared', version: '1.0.0', nodes: [n1] };
+  const planV2: TaskPlan = { ...w.plan, id: 'plan_shared', version: '2.0.0', nodes: [n1] };
+  const u1 = w.kernel.materialise(planV1, n1, w.baseline);
+  const u2 = w.kernel.materialise(planV2, n1, w.baseline);
+  assert.notEqual(u1.id, u2.id, 'two distinct WorkUnits, one per plan version, same nodeId');
+
+  const r = w.kernel.cancelPlan('plan_shared', '1.0.0', 'v1 abandoned');
+  assert.equal(r.cancelled, true, r.reason);
+
+  assert.equal(w.kernel.planStatus('plan_shared', '1.0.0'), 'cancelled');
+  assert.equal(w.kernel.expect(u1.id).status, 'cancelled');
+
+  assert.equal(w.kernel.planStatus('plan_shared', '2.0.0'), 'approved', 'the other version is untouched');
+  assert.equal(w.kernel.expect(u2.id).status, 'validated', 'the other version\'s member unit is untouched');
+
+  const evs = w.events.byType('plan.cancelled');
+  assert.equal(evs.length, 1, 'only v1 was cancelled');
+  assert.equal((evs[0]!.payload as { version: string }).version, '1.0.0');
 });
