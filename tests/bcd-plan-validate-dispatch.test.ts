@@ -830,3 +830,153 @@ test('T-D22 materialise() refuses a new node under an already-`partial` plan', (
   assert.equal(w.kernel.units.size, 1, 'no new WorkUnit was created for n2');
   assert.equal(w.kernel.planStatus(plan.id, plan.version), 'partial', 'plan projection unchanged');
 });
+
+// ------------------------------------------- Artifact-input content-hash pinning
+// Phase 2 Slice 3. Note 02 §9 step 2/3, §10: an `artifact`-edge predecessor
+// pins its accepted artifact's id and content hash into the dependent
+// unit's `inputs`, the first time admit() observes the predecessor
+// accepted — materialise() cannot do this itself, since nodes are
+// materialised before their predecessors run (T-D8's own pattern), so
+// admission is the only point this is knowable. `as`/`segments` have no
+// authored source anywhere in the plan schema (neither PlanNode nor a plan
+// edge declares a binding name or segment scope) — `as` defaults to the
+// predecessor's own planNodeId (already-present data) and `segments` to
+// `[]`, the smallest non-fabricated choice, not a stand-in for a future
+// recipe-binding declaration.
+
+function driveToAccepted(w: ReturnType<typeof makeWorld>, unitId: string) {
+  w.kernel.acquireLease(unitId, `s_${unitId}`);
+  w.kernel.runAttempt(unitId, FIXING_SCRIPT);
+  const st = w.kernel.expect(unitId);
+  const art = st.artifacts[st.artifacts.length - 1]!;
+  w.kernel.recordApproval(approvalFor('merge', art.id, art.contentHash));
+  const r = w.kernel.accept(unitId, art.id);
+  if (!r.accepted) throw new Error(`driveToAccepted: accept() refused — ${r.reason}`);
+  return art;
+}
+
+test("T-D23 an artifact-kind dependency pins the predecessor's accepted artifact id and content hash into inputs", () => {
+  const w = makeWorld({ script: FIXING_SCRIPT });
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1, n2], edges: [{ from: 'n1', to: 'n2', kind: 'artifact' }] };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  const u2 = w.kernel.materialise(plan, n2, w.baseline);
+  assert.deepEqual(u2.inputs, [], 'no pin before the predecessor is accepted');
+
+  const art1 = driveToAccepted(w, u1.id);
+
+  const admission = w.kernel.admit(u2.id);
+  assert.equal(admission.admitted, true, admission.reason);
+  const inputs = w.kernel.expect(u2.id).unit.inputs;
+  assert.equal(inputs.length, 1);
+  assert.equal(inputs[0]!.artifactId, art1.id);
+  assert.equal(inputs[0]!.contentHash, art1.contentHash, 'pinned hash is the exact accepted artifact hash');
+  assert.equal(inputs[0]!.as, 'n1', "defaults to the predecessor's planNodeId — no authored binding name exists");
+  assert.deepEqual(inputs[0]!.segments, []);
+});
+
+test('T-D24 an ordering-kind dependency never creates an input pin', () => {
+  const w = makeWorld({ script: FIXING_SCRIPT });
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1, n2], edges: [{ from: 'n1', to: 'n2', kind: 'ordering' }] };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  const u2 = w.kernel.materialise(plan, n2, w.baseline);
+
+  driveToAccepted(w, u1.id);
+
+  const admission = w.kernel.admit(u2.id);
+  assert.equal(admission.admitted, true, admission.reason);
+  assert.deepEqual(w.kernel.expect(u2.id).unit.inputs, [], 'ordering edges consume nothing — no pin, unchanged behaviour');
+});
+
+test('T-D25 multiple artifact-kind dependencies pin the complete, correctly-attributed input set', () => {
+  const w = makeWorld({ script: FIXING_SCRIPT });
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const n3 = { ...node(w.plan), nodeId: 'n3' };
+  const plan: TaskPlan = {
+    ...w.plan, nodes: [n1, n2, n3],
+    edges: [{ from: 'n1', to: 'n3', kind: 'artifact' }, { from: 'n2', to: 'n3', kind: 'artifact' }],
+  };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  const u2 = w.kernel.materialise(plan, n2, w.baseline);
+  const u3 = w.kernel.materialise(plan, n3, w.baseline);
+
+  const art1 = driveToAccepted(w, u1.id);
+  const art2 = driveToAccepted(w, u2.id);
+
+  const admission = w.kernel.admit(u3.id);
+  assert.equal(admission.admitted, true, admission.reason);
+  const inputs = w.kernel.expect(u3.id).unit.inputs;
+  assert.equal(inputs.length, 2, 'the complete input set — one pin per artifact-kind dependency');
+  const byAs = new Map(inputs.map((i) => [i.as, i]));
+  assert.equal(byAs.get('n1')!.artifactId, art1.id);
+  assert.equal(byAs.get('n1')!.contentHash, art1.contentHash);
+  assert.equal(byAs.get('n2')!.artifactId, art2.id);
+  assert.equal(byAs.get('n2')!.contentHash, art2.contentHash);
+});
+
+test('T-D26 an already-established pin is not silently changed on a later admit() call', () => {
+  const w = makeWorld({ script: FIXING_SCRIPT });
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1, n2], edges: [{ from: 'n1', to: 'n2', kind: 'artifact' }] };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  const u2 = w.kernel.materialise(plan, n2, w.baseline);
+
+  driveToAccepted(w, u1.id);
+
+  assert.equal(w.kernel.admit(u2.id).admitted, true);
+  const firstPins = w.kernel.expect(u2.id).unit.inputs;
+  assert.equal(firstPins.length, 1);
+
+  // A repeated admit() call on the now-`ready` unit re-walks the same
+  // dependency loop (admit() has no guard against being called again) —
+  // proving the pin is genuinely idempotent, not merely computed once
+  // because admit() happened to only run once.
+  const second = w.kernel.admit(u2.id);
+  assert.equal(second.admitted, true, second.reason);
+  const secondPins = w.kernel.expect(u2.id).unit.inputs;
+  assert.equal(secondPins.length, 1, 'no duplicate pin on a repeated admit() call');
+  assert.deepEqual(secondPins, firstPins);
+});
+
+test('T-D27 a pinned input whose hash no longer matches the stored artifact refuses admission rather than trusting it', () => {
+  const w = makeWorld({ script: FIXING_SCRIPT });
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1, n2], edges: [{ from: 'n1', to: 'n2', kind: 'artifact' }] };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  const u2 = w.kernel.materialise(plan, n2, w.baseline);
+
+  driveToAccepted(w, u1.id);
+  assert.equal(w.kernel.admit(u2.id).admitted, true);
+  assert.equal(w.kernel.expect(u2.id).unit.inputs.length, 1);
+
+  // Simulates drift — not reachable via any real mechanism today, since an
+  // accepted artifact never changes and an accepted unit never attempts
+  // again — asserted directly to prove the Note 02 §9 step 3 guard actually
+  // refuses rather than silently re-trusting a stale pin (§10 rule 2).
+  const st2 = w.kernel.expect(u2.id);
+  st2.unit = { ...st2.unit, inputs: [{ ...st2.unit.inputs[0]!, contentHash: 'sha256:corrupted' }] };
+
+  const admission = w.kernel.admit(u2.id);
+  assert.equal(admission.admitted, false);
+  assert.equal(admission.reason, 'input_hash_mismatch');
+});
+
+test('T-D28 an artifact-kind dependent cannot proceed while its predecessor is unaccepted — no pin, admission deferred', () => {
+  const w = makeWorld({ script: FIXING_SCRIPT });
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1, n2], edges: [{ from: 'n1', to: 'n2', kind: 'artifact' }] };
+  w.kernel.materialise(plan, n1, w.baseline);
+  const u2 = w.kernel.materialise(plan, n2, w.baseline);
+
+  const before = w.kernel.admit(u2.id);
+  assert.equal(before.admitted, false);
+  assert.equal(before.reason, 'dependency_unmet');
+  assert.deepEqual(w.kernel.expect(u2.id).unit.inputs, [], 'no pin materialises before the predecessor is accepted');
+});
