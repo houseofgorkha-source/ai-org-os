@@ -107,7 +107,19 @@ export class Kernel {
     // The stored `plan` reference is read-only here on; its own status field
     // is never written back to — only this projection's `status` is.
     const planKeyStr = `${plan.id}@${plan.version}`;
-    if (!this.plans.has(planKeyStr)) this.plans.set(planKeyStr, { plan, status: plan.status });
+    const planRec = this.plans.get(planKeyStr);
+    // Caller error, same class as the predecessor-ordering check below
+    // (T-D7's precedent): a terminal plan (complete/partial/cancelled) can
+    // never gain a new member unit. Checked against the kernel's OWN live
+    // projection status, never the caller's possibly-stale input `plan`
+    // object, so this is accurate even long after cancelPlan() ran.
+    if (planRec && TERMINAL_PLAN_STATUSES.has(planRec.status)) {
+      throw new Error(
+        `materialise: plan '${planKeyStr}' is already ${planRec.status} — ` +
+        `cannot materialise a new node under a terminal plan`,
+      );
+    }
+    if (!planRec) this.plans.set(planKeyStr, { plan, status: plan.status });
 
     const spec = resolveSpec(node, this.d.registry, this.d.policy, this.d.resolver, plan.budgetAggregate.execution);
     const budget: EffectiveBudget = spec.effectiveBudget;
@@ -514,6 +526,18 @@ export class Kernel {
     this.emit('approval.granted', [a.subject.ref], { kind: a.subject.kind, quorum: a.quorum });
   }
 
+  /**
+   * The blocking-gates check below existed as accept()'s only correctness
+   * anchor; it is not sufficient on its own, because gateResults are never
+   * cleared by cancel()/reject() — a unit cancelled AFTER its gates already
+   * passed still has blockingOk === true. The explicit status guard closes
+   * that gap. It runs AFTER the blocking-gates check, not before (unlike
+   * reject()'s ordering), because T-J4 asserts a unit in `attempt_failed`
+   * is refused with a "blocking gates" reason specifically — putting the
+   * status guard first would return a different reason and break that
+   * existing, unmodified test. The predicate itself still matches reject()'s
+   * exactly (`status !== 'awaiting_approval'`).
+   */
   accept(unitId: string, artifactId: string): { accepted: boolean; reason?: string } {
     const st = this.expect(unitId);
     const art = st.artifacts.find((a) => a.id === artifactId);
@@ -522,6 +546,7 @@ export class Kernel {
       .filter((b) => b.blocking)
       .every((b) => st.gateResults.some((r) => r.gateRef === b.gateRef && r.verdict === 'pass'));
     if (!blockingOk) return { accepted: false, reason: 'blocking gates not all passed' };
+    if (st.status !== 'awaiting_approval') return { accepted: false, reason: `status ${st.status}` };
     const ap = this.approvals.find((x) =>
       x.subject.kind === 'merge' && x.subject.ref === artifactId &&
       x.subject.contentHash === art.contentHash && x.decision === 'approve' && quorumMet(x));
@@ -791,6 +816,9 @@ const TERMINAL_UNIT_STATUSES = new Set<WorkUnitStatus>(['rejected', 'invalid', '
  * treated here as the resolved reading, not re-litigated).
  */
 const CANCELLABLE_STATUSES = new Set<WorkUnitStatus>(['validated', 'ready', 'blocked', 'attempt_failed', 'awaiting_approval']);
+
+/** The three terminal values of `TaskPlan['status']` — materialise() refuses to add a member unit to a plan in any of these. */
+const TERMINAL_PLAN_STATUSES = new Set<TaskPlan['status']>(['complete', 'partial', 'cancelled']);
 
 function materialKey(u: WorkUnit): string { return `${u.planId}@${u.planVersion}#${u.planNodeId}`; }
 

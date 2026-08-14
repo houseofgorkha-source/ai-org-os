@@ -168,6 +168,44 @@ test('T-J9 reject()/cancel() are idempotent: a second call on an already-termina
   assert.equal(w2.events.byType('workunit.cancelled').length, 1, 'no duplicate event');
 });
 
+// ------------------------------------------- J10-J11: accept() status guard
+// Phase 2 Slice 2. accept() previously anchored correctness solely on
+// blockingOk (gateResults, which cancel()/reject() never clear), so a unit
+// cancelled AFTER its gates already passed could still be "accepted" by a
+// stale approval recorded before cancellation. The guard runs after the
+// blocking-gates check (not before, unlike reject()'s ordering) so T-J4's
+// existing "blocking gates" reason stays intact — see kernel.ts's own
+// accept() doc comment for why.
+
+test('T-J10 accept() refuses a cancelled unit even with a stale but hash-matching approval', () => {
+  const { w, u, art } = fullRun();
+  // Approve BEFORE cancelling, so the approval is genuinely bound to this
+  // exact content hash — proving the guard, not merely a hash mismatch.
+  w.kernel.recordApproval(approvalFor('merge', art.id, art.contentHash));
+  assert.equal(w.kernel.cancel(u.id, 'no longer needed').cancelled, true);
+  assert.equal(w.kernel.expect(u.id).status, 'cancelled');
+  assert.equal(w.kernel.expect(u.id).artifacts.find((a) => a.id === art.id)!.status, 'abandoned');
+
+  const r = w.kernel.accept(u.id, art.id);
+  assert.equal(r.accepted, false, 'a stale approval must not resurrect a cancelled unit');
+  assert.equal(r.reason, 'status cancelled');
+  assert.equal(w.kernel.expect(u.id).status, 'cancelled', 'status unchanged');
+  assert.equal(w.kernel.expect(u.id).artifacts.find((a) => a.id === art.id)!.status, 'abandoned', 'artifact unchanged — never reverted to accepted');
+  assert.equal(w.events.byType('workunit.accepted').length, 0, 'no acceptance event was ever emitted');
+});
+
+test('T-J11 accept() refuses an already-accepted unit — no duplicate event', () => {
+  const { w, u, art } = fullRun();
+  w.kernel.recordApproval(approvalFor('merge', art.id, art.contentHash));
+  assert.equal(w.kernel.accept(u.id, art.id).accepted, true);
+  assert.equal(w.kernel.expect(u.id).status, 'accepted');
+
+  const second = w.kernel.accept(u.id, art.id);
+  assert.equal(second.accepted, false, 'already accepted — refused, not re-applied');
+  assert.equal(second.reason, 'status accepted');
+  assert.equal(w.events.byType('workunit.accepted').length, 1, 'no duplicate event');
+});
+
 // ======================================= K. Events, replay, and recovery
 
 test('T-K1 all state is a projection: rebuilding from events alone matches', () => {

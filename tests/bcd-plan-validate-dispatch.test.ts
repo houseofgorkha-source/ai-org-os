@@ -755,3 +755,78 @@ test('T-P9 version isolation: cancelling one version of a planId never touches a
   assert.equal(evs.length, 1, 'only v1 was cancelled');
   assert.equal((evs[0]!.payload as { version: string }).version, '1.0.0');
 });
+
+// ------------------------------------------- materialise() terminal-plan guard
+// Phase 2 Slice 2. Same caller-error class as T-D7's out-of-order-predecessor
+// check (materialise() has no result-object shape to refuse into, so it
+// throws, matching that precedent) — a plan whose kernel-tracked projection
+// is already complete/partial/cancelled can never gain a new member unit.
+// Checked against the LIVE projection, never the caller's input `plan.status`.
+
+test('T-D20 materialise() refuses a new node under an already-cancelled plan; already-materialised nodes stay idempotent', () => {
+  const w = makeWorld();
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1, n2] };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+
+  assert.equal(w.kernel.cancelPlan(plan.id, plan.version, 'no longer needed').cancelled, true);
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'cancelled');
+
+  assert.throws(() => w.kernel.materialise(plan, n2, w.baseline), /already cancelled/);
+  assert.equal(w.kernel.units.size, 1, 'no new WorkUnit was created for n2');
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'cancelled', 'plan projection unchanged by the refused attempt');
+
+  // The already-materialised n1 remains idempotent even now (Note 06 §5) —
+  // the guard only blocks NEW nodes, not re-calls on existing ones.
+  const again = w.kernel.materialise(plan, n1, w.baseline);
+  assert.equal(again.id, u1.id);
+  assert.equal(w.kernel.units.size, 1);
+});
+
+test('T-D21 materialise() refuses a new node under an already-`complete` plan', () => {
+  // recomputePlanStatus requires EVERY node in plan.nodes to have a member
+  // before resolving complete/partial (unlike cancelPlan(), which sets the
+  // projection directly) — so plan.nodes here is just [n1], driven fully to
+  // `complete`, and the guard is then probed with a THIRD node object that
+  // was never part of that list. materialise() doesn't validate node-list
+  // membership (that's validatePlan()'s job, not exercised here), so this
+  // still proves the guard: the plan's LIVE projection status is checked
+  // independently of which node is being materialised.
+  const w = makeWorld({ script: FIXING_SCRIPT });
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1] };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  w.kernel.acquireLease(u1.id, 's1');
+  w.kernel.runAttempt(u1.id, FIXING_SCRIPT);
+  const st1 = w.kernel.expect(u1.id);
+  const art1 = st1.artifacts[st1.artifacts.length - 1]!;
+  w.kernel.recordApproval(approvalFor('merge', art1.id, art1.contentHash));
+  w.kernel.accept(u1.id, art1.id);
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'complete');
+
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  assert.throws(() => w.kernel.materialise(plan, n2, w.baseline), /already complete/);
+  assert.equal(w.kernel.units.size, 1, 'no new WorkUnit was created for n2');
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'complete', 'plan projection unchanged');
+});
+
+test('T-D22 materialise() refuses a new node under an already-`partial` plan', () => {
+  // Drives to `partial` the same way T-D11/T-P6 do: a real terminal-failure
+  // transition (denial-budget escalation), not a direct status assignment.
+  // Same out-of-list-node approach as T-D21, for the same reason.
+  const spam = (_p: string, t: number): string => (t <= 6 ? 'CALL net.fetch https://x.invalid/a {"path":"a"}' : 'DONE');
+  const w = makeWorld({ script: spam });
+  const n1 = { ...node(w.plan), nodeId: 'n1' };
+  const plan: TaskPlan = { ...w.plan, nodes: [n1] };
+  const u1 = w.kernel.materialise(plan, n1, w.baseline);
+  w.kernel.acquireLease(u1.id, 's1');
+  w.kernel.runAttempt(u1.id, spam);
+  assert.equal(w.kernel.expect(u1.id).status, 'escalated');
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'partial');
+
+  const n2 = { ...node(w.plan), nodeId: 'n2' };
+  assert.throws(() => w.kernel.materialise(plan, n2, w.baseline), /already partial/);
+  assert.equal(w.kernel.units.size, 1, 'no new WorkUnit was created for n2');
+  assert.equal(w.kernel.planStatus(plan.id, plan.version), 'partial', 'plan projection unchanged');
+});
