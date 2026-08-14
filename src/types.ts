@@ -427,6 +427,19 @@ export type ExecutorTermination =
   | 'completed' | 'model_refused' | 'deadline' | 'denial_budget' | 'tool_fault' | 'internal_error';
 
 /**
+ * A structured, non-narrative classification of a single model turn's parsed
+ * output — durable forensic evidence for why a turn produced zero tool calls,
+ * without carrying any of the model's actual text (which stays PRIVATE, in
+ * `narrative`, as it always has). Distinguishes the three shapes a
+ * `termination: 'completed'` attempt with zero `toolInvocations` can hide:
+ * the model explicitly signalled `done`, it returned prose with no CALL
+ * attempt at all (`no_action`), or it attempted CALL syntax that didn't
+ * parse (`malformed`). `tool_call` and `refused` cover the remaining, already
+ * — distinguishable — cases for completeness.
+ */
+export type ModelResponseShape = 'tool_call' | 'done' | 'refused' | 'no_action' | 'malformed';
+
+/**
  * T-F7 (type-level): this type MUST NOT gain `artifact`, `verdict`, `status`,
  * `cost`, `consumption`, or any success claim. The kernel derives all of those.
  */
@@ -436,6 +449,8 @@ export interface ExecutorResult {
   readonly toolInvocations: readonly ToolCallRecord[];
   readonly modelInvocations: readonly ModelCallRecord[];
   readonly narrative: string;   // PRIVATE, debugging only
+  /** One entry per model call that reached parsing, keyed by that call's ModelCallRecord.seq — never a 1:1 positional assumption against modelInvocations, since a budget_halt/error record never reaches parseActions. */
+  readonly responseShapes: readonly { seq: number; shape: ModelResponseShape }[];
 }
 
 export interface CapabilityToken {

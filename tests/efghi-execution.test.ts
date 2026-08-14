@@ -324,6 +324,56 @@ test('T-F13 DONE-after-work and an idle no-op are distinguishable by outcome, th
   assert.notEqual(worked.artifacts[0]!.contentHash, idle.artifacts[0]!.contentHash);
 });
 
+// T-F14/15/16: durable forensic evidence for WHY a `completed` attempt with
+// zero tool calls happened. Regression for the real aios-2node-I0cXWO run,
+// where a real model call returned `outcome:"ok"` with zero tool calls and
+// the only way to know what the turn actually was — DONE, silent prose, or a
+// malformed CALL attempt — was an in-memory `narrative` that dies with the
+// process. `model.served` events now durably carry a `responseShape`
+// classification (never raw model text) so this is answerable from
+// events.jsonl alone, after the fact, without rerunning anything.
+
+test('T-F14 a turn that emits DONE records model.served responseShape "done"', () => {
+  const { w, a } = run(() => 'DONE');
+  assert.equal(a.modelInvocations.length, 1);
+  assert.equal(a.toolInvocations.length, 0, 'reproduces the zero-tool-call shape');
+  const served = w.events.byType('model.served');
+  assert.equal(served.length, 1);
+  assert.equal(served[0]!.payload.responseShape, 'done');
+});
+
+test('T-F15 a turn with plain text and no CALL attempt records model.served responseShape "no_action"', () => {
+  const { w, a } = run((_p: string, turn: number) => (turn === 1 ? 'Let me think about this for a moment.' : 'DONE'));
+  // The FIRST turn is the one under test: no CALL syntax, not DONE, not
+  // malformed — the exact shape that ended the aios-2node-I0cXWO attempt
+  // after a single turn with zero tool calls (executor.ts:54).
+  assert.equal(a.toolInvocations.length, 0);
+  const served = w.events.byType('model.served');
+  assert.equal(served.length, 1, 'the loop ends at turn 1 — no_action never gets a turn 2');
+  assert.equal(served[0]!.payload.responseShape, 'no_action');
+});
+
+test('T-F16 a turn with an unparseable CALL records model.served responseShape "malformed"', () => {
+  const { w, a } = run((_p: string, turn: number) =>
+    turn === 1 ? 'CALL fs.write workspace://src/app.js {"path":"src/app.js" "content":"bad}' : 'DONE');
+  // Malformed syntax is recoverable (executor.ts §"malformed is DATA, not
+  // silence"): the loop gets a turn 2, which this script ends with DONE. The
+  // FIRST model.served event is the one under test.
+  assert.equal(a.toolInvocations.length, 0, 'the malformed CALL never reaches the tool broker');
+  const served = w.events.byType('model.served');
+  assert.equal(served.length, 2, 'malformed does not end the loop — a corrective turn follows');
+  assert.equal(served[0]!.payload.responseShape, 'malformed');
+  assert.equal(served[1]!.payload.responseShape, 'done');
+});
+
+test('T-F17 a turn that issues a real tool call records model.served responseShape "tool_call"', () => {
+  const { w, a } = run(FIXING_SCRIPT);
+  assert.ok(a.toolInvocations.length > 0);
+  const served = w.events.byType('model.served');
+  assert.ok(served.length >= 1);
+  assert.equal(served[0]!.payload.responseShape, 'tool_call', 'the turn that actually wrote/read is classified distinctly from done/no_action/malformed');
+});
+
 // ===================================================== G. Workspace/harvest
 
 test('T-G1 each attempt gets a fresh workspace from the same baseline', () => {

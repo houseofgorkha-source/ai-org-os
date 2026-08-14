@@ -1,5 +1,5 @@
 import type {
-  ExecutorInvocation, ExecutorResult, ExecutorTermination, ModelCallRecord, ToolCallRecord,
+  ExecutorInvocation, ExecutorResult, ExecutorTermination, ModelCallRecord, ModelResponseShape, ToolCallRecord,
 } from './types.ts';
 import { BudgetExhausted, ModelBroker, ToolBroker } from './broker.ts';
 import type { ModelProvider } from './broker.ts';
@@ -30,6 +30,7 @@ interface Action {
 
 export function runExecutor(inv: ExecutorInvocation, deps: ExecutorDeps): ExecutorResult {
   const narrative: string[] = [];
+  const responseShapes: { seq: number; shape: ModelResponseShape }[] = [];
   let termination: ExecutorTermination = 'completed';
   let step = 0;
   const deadlineMs = Date.parse(inv.deadline);
@@ -46,6 +47,12 @@ export function runExecutor(inv: ExecutorInvocation, deps: ExecutorDeps): Execut
       narrative.push(`step ${step}: ${out.text.slice(0, 200)}`);
 
       const parsed = parseActions(out.text);
+      // Durable, non-narrative forensic evidence (Note 07 §12: no raw model
+      // text leaves this function) of what THIS turn's parse actually was —
+      // keyed by the ModelCallRecord this call just pushed, never by
+      // position, since a budget_halt/error call never reaches this line.
+      const lastSeq = deps.models.records[deps.models.records.length - 1]?.seq;
+      if (lastSeq !== undefined) responseShapes.push({ seq: lastSeq, shape: classifyResponse(parsed) });
       if (parsed.done) break;
       if (parsed.refused) { termination = 'model_refused'; break; }
       // A malformed CALL is recoverable, exactly like a denial (Note 07 §7):
@@ -93,7 +100,17 @@ export function runExecutor(inv: ExecutorInvocation, deps: ExecutorDeps): Execut
     toolInvocations: deps.tools.records as readonly ToolCallRecord[],
     modelInvocations: deps.models.records as readonly ModelCallRecord[],
     narrative: narrative.join('\n'),
+    responseShapes,
   };
+}
+
+/** Pure classification of one turn's parsed output — see `ModelResponseShape` (types.ts). */
+function classifyResponse(parsed: ReturnType<typeof parseActions>): ModelResponseShape {
+  if (parsed.done) return 'done';
+  if (parsed.refused) return 'refused';
+  if (parsed.malformed > 0) return 'malformed';
+  if (parsed.actions.length > 0) return 'tool_call';
+  return 'no_action';
 }
 
 const CALL_LINE = /^\s*CALL\s+(\S+)\s+(\S+)\s*(\{.*\})?\s*$/;

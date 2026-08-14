@@ -214,14 +214,53 @@ export class Kernel {
     // posture as the scope-conflict check below.
     let anyDependencyFailed = false;
     let anyDependencyPending = false;
+    let inputHashMismatch = false;
     let failedDependency: { unitId: string; kind: string } | null = null;
+    const newPins: WorkUnit['inputs'][number][] = [];
     for (const dep of st.unit.dependsOn) {
       const depState = this.units.get(dep.unitId);
       if (!depState) continue;
-      if (depState.status === 'accepted') continue;
+      if (depState.status === 'accepted') {
+        // Note 02 §9 step 2 / §10: an `artifact`-edge predecessor pins its
+        // accepted artifact's content hash into this unit's `inputs`, the
+        // first time admit() observes it accepted — materialise() cannot do
+        // this (nodes are materialised before predecessors run, see T-D8),
+        // so admission is the correct, and only, point this is knowable.
+        // `as` and `segments` have no authored source anywhere in the plan
+        // schema (neither PlanNode nor a plan edge declares a binding name
+        // or segment scope) — `as` defaults to the predecessor's own
+        // planNodeId (already-present data) and `segments` to `[]`
+        // (requests nothing), the smallest non-fabricated choice, not a
+        // stand-in for a future recipe-binding declaration.
+        if (dep.kind === 'artifact') {
+          const acceptedArtifact = depState.artifacts.find((a) => a.status === 'accepted');
+          if (acceptedArtifact) {
+            const existing = st.unit.inputs.find((i) => i.artifactId === acceptedArtifact.id);
+            if (existing) {
+              // §9 step 3: pinned hash must still match the stored artifact.
+              // Unreachable via normal flow today — an accepted artifact
+              // never changes and an accepted unit never attempts again —
+              // but checked explicitly rather than assumed, per §10 rule 2.
+              if (existing.contentHash !== acceptedArtifact.contentHash) inputHashMismatch = true;
+            } else {
+              newPins.push({
+                artifactId: acceptedArtifact.id, contentHash: acceptedArtifact.contentHash,
+                as: depState.unit.planNodeId, segments: [],
+              });
+            }
+          }
+        }
+        continue;
+      }
       if (TERMINAL_UNIT_STATUSES.has(depState.status)) { anyDependencyFailed = true; failedDependency = dep; }
       else anyDependencyPending = true;
     }
+    // Pins accumulate progressively across admit() calls and are immutable
+    // once set (never reassigned above, only appended to) — applied
+    // regardless of which branch below fires, so a later admit() call sees
+    // every predecessor pinned as soon as each individually becomes accepted.
+    if (newPins.length > 0) st.unit = { ...st.unit, inputs: [...st.unit.inputs, ...newPins] };
+    if (inputHashMismatch) return { admitted: false, reason: 'input_hash_mismatch' };
     if (anyDependencyFailed) {
       // The entry guard above already limits st.status to validated/ready/
       // attempt_failed here, so this is always a fresh transition into blocked.
@@ -339,7 +378,16 @@ export class Kernel {
     );
 
     for (const r of tools.records) this.emit(r.outcome === 'denied' ? 'tool.denied' : 'tool.invoked', [unitId, attemptId], { ...r });
-    for (const r of models.records) this.emit('model.served', [unitId, attemptId], { ...r });
+    // responseShape is structured forensic evidence (never raw model text —
+    // see ModelResponseShape, types.ts) of what a turn's parse produced, so a
+    // `completed` attempt with zero tool calls is durably distinguishable in
+    // the event trail as `done` / `no_action` / `malformed` after the fact.
+    // Keyed by seq, not position: a budget_halt/error record never has one.
+    const shapeBySeq = new Map(result.responseShapes.map((s) => [s.seq, s.shape]));
+    for (const r of models.records) {
+      const shape = shapeBySeq.get(r.seq);
+      this.emit('model.served', [unitId, attemptId], shape ? { ...r, responseShape: shape } : { ...r });
+    }
     st.denialsByAttempt.set(attemptId, tools.denialRecords);
 
     const status: AttemptStatus =
