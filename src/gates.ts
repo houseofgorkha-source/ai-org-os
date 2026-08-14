@@ -48,6 +48,13 @@ impls.set('artifact.schema_valid', (env) => {
     : { verdict: 'fail', evidence: [ev('assertion', `missing segments: ${missing.join(', ')}`)] };
 });
 
+impls.set('artifact.nonempty_change', (env) => {
+  const files = (seg(env.artifact, 'files_touched') as string[] | undefined) ?? [];
+  return files.length > 0
+    ? { verdict: 'pass', evidence: [ev('assertion', `${files.length} file(s) touched`)] }
+    : { verdict: 'fail', evidence: [ev('assertion', 'no files touched: artifact contains no change')] };
+});
+
 impls.set('deps.unchanged', (env) => {
   const files = (seg(env.artifact, 'files_touched') as string[] | undefined) ?? [];
   const manifests = files.filter((f) => /package(-lock)?\.json$|requirements\.txt$/.test(f));

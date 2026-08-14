@@ -47,7 +47,7 @@ test('T-A2 a tool declaring effects: external is refused at token minting', () =
 test('T-A3 gates require pass_means, a must_fail fixture, and C0 determinism', () => {
   const r = new Registry();
   for (const g of GATES) r.registerGate(g, 'human:founder');
-  assert.equal(GATES.length, 7);
+  assert.equal(GATES.length, 8);
 
   const noFail = signed({ ...GATES[1]!, id: 'no.negative', fixtures: { ...GATES[1]!.fixtures, mustFail: [] } } as unknown as GateDef);
   assert.throws(() => r.registerGate(noFail as GateDef, 'human:founder'), /must_fail/);

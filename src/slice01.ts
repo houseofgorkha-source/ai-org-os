@@ -130,8 +130,8 @@ function ensureFixtureWorkspaces(): { clean: string; violating: string } {
 /** Fixture pairs so every gate demonstrates it can both accept AND reject. */
 function fixtureArtifact(clean: boolean, gateId: string): unknown {
   const ws = ensureFixtureWorkspaces();
-  const files = clean ? ['src/app.js'] : gateId === 'deps.unchanged' ? ['package.json'] : ['test/other.js'];
-  const diff = clean ? '+const x = 1;' : gateId === 'api.schema_unchanged' ? '+export function q() {}' : '+const y = 2;';
+  const files = clean ? ['src/app.js'] : gateId === 'deps.unchanged' ? ['package.json'] : gateId === 'artifact.nonempty_change' ? [] : ['test/other.js'];
+  const diff = clean ? '+const x = 1;' : gateId === 'api.schema_unchanged' ? '+export function q() {}' : gateId === 'artifact.nonempty_change' ? '' : '+const y = 2;';
   const segments = [
     { name: 'diff', visibility: 'public', content: diff, hash: '' },
     { name: 'files_touched', visibility: 'public', content: files, hash: '' },
@@ -160,6 +160,7 @@ function fixtureArtifact(clean: boolean, gateId: string): unknown {
 
 export const GATES: GateDef[] = [
   gate({ id: 'artifact.schema_valid', klass: 'C0', stage: 0, kind: 'deterministic', cost: 'free', passMeans: 'All required public segments are present.', failMeans: 'A required segment is missing.' }),
+  gate({ id: 'artifact.nonempty_change', klass: 'C0', stage: 0, kind: 'deterministic', cost: 'free', passMeans: 'At least one file was touched by the artifact.', failMeans: 'The artifact touches zero files (no change was produced).' }),
   gate({ id: 'deps.unchanged', klass: 'C0', stage: 1, kind: 'deterministic', cost: 'cheap', passMeans: 'No dependency manifest was changed.', failMeans: 'A dependency manifest changed.' }),
   gate({ id: 'locality.confined', klass: 'C0', stage: 1, kind: 'deterministic', cost: 'cheap', passMeans: 'Every changed path lies within the unit\'s affected_paths.', failMeans: 'A change lies outside declared scope.', appliesWhen: 'artifact.type == "CodeDiff"' }),
   gate({ id: 'api.schema_unchanged', klass: 'C0', stage: 1, kind: 'deterministic', cost: 'cheap', passMeans: 'The exported surface is unchanged.', failMeans: 'The exported surface changed.' }),
@@ -192,6 +193,7 @@ export const GATE_PROFILE: GateProfile = {
   id: 'mechanical_change', version: '1.0.0', owner: 'human:founder', composition: 'union_only',
   bindings: [
     { gateRef: 'artifact.schema_valid@1.0.0', blocking: true, order: 0 },
+    { gateRef: 'artifact.nonempty_change@1.0.0', blocking: true, order: 5 },
     { gateRef: 'deps.unchanged@1.0.0', blocking: true, order: 10 },
     { gateRef: 'locality.confined@1.0.0', blocking: true, order: 11 },
     { gateRef: 'api.schema_unchanged@1.0.0', blocking: true, order: 12 },

@@ -378,11 +378,11 @@ test('T-G5 a failed attempt\'s workspace is preserved for inspection', () => {
 test('T-H1/T-H5 cheap gates are exhausted for evidence; expensive stages short-circuit', () => {
   const { st } = run(DEFAULT_SCRIPT);
   const verdicts = st.gateResults.map((r) => `${r.gateRef.split('@')[0]}=${r.verdict}`);
-  assert.equal(st.gateResults.length, 6, 'all six ran');
+  assert.equal(st.gateResults.length, 7, 'all seven ran');
   assert.ok(verdicts.includes('tests.affected_pass=fail'));
   const fr = st.failures[0]!;
-  assert.equal(fr.gateResults.length, 6, 'ONE FailureRecord listing every result, not just the first');
-  assert.equal(fr.gateResults.filter((g) => g.verdict === 'pass').length, 5);
+  assert.equal(fr.gateResults.length, 7, 'ONE FailureRecord listing every result, not just the first');
+  assert.equal(fr.gateResults.filter((g) => g.verdict === 'pass').length, 6);
 });
 
 test('T-H2 a gate `error` is infrastructure: no FailureRecord, no attempt consumed', () => {
@@ -422,7 +422,7 @@ test('T-H4 gates run in stage-ascending order', () => {
   const { st } = run(FIXING_SCRIPT);
   const stages = st.gateResults.map((r) => {
     const id = r.gateRef.split('@')[0]!;
-    return { 'artifact.schema_valid': 0, 'deps.unchanged': 1, 'locality.confined': 1, 'api.schema_unchanged': 1, 'build.typecheck': 2, 'tests.affected_pass': 3 }[id] ?? 9;
+    return { 'artifact.schema_valid': 0, 'artifact.nonempty_change': 0, 'deps.unchanged': 1, 'locality.confined': 1, 'api.schema_unchanged': 1, 'build.typecheck': 2, 'tests.affected_pass': 3 }[id] ?? 9;
   });
   assert.deepEqual(stages, [...stages].sort((a, b) => a - b));
 });
@@ -450,6 +450,48 @@ test('T-H8 gate evidence visibility is the max of anything it quotes', () => {
     assert.equal(vis.size <= 1, true, 'evidence visibility is uniform per result');
     assert.equal(r.evidence.every((e) => e.visibility === 'public'), true, 'slice 01 gates quote only public segments');
   }
+});
+
+test('T-H9 an artifact with zero files touched fails verification even when every other gate would pass', () => {
+  // Reproduces the real aios-2node-Lx5KMr / PuYjDz forensic gap: a model turn
+  // that ends after one call with no tool invocation at all produces a
+  // filesTouched=0 artifact. Every other gate is content-vacuous on an empty
+  // diff (schema segments are still present, there is no dependency/scope/API
+  // change, there is nothing to parse, and tests.affected_pass reads the
+  // UNCHANGED baseline rather than this unit's diff) — so without
+  // artifact.nonempty_change this reaches awaiting_approval on a no-op.
+  const w = makeWorld({ script: () => 'DONE' });
+
+  // Bridge the baseline so tests.affected_pass already passes on an untouched
+  // workspace, exactly as harness-2node.ts bridges node 2's baseline onto
+  // node 1's completed migration — otherwise the objective/gate mismatch
+  // (not the empty-diff gap under test) would be what fails the attempt.
+  const migrated = 'function oldFn(a) { return a + 1; }\nfunction newFn(a) { return a + 1; }\n'
+    + 'function alpha(x) { return newFn(x); }\nfunction beta(x) { return newFn(x) * 2; }\n'
+    + 'module.exports = { alpha, beta, newFn, oldFn };\n';
+  writeFileSync(join(w.repoRoot, 'src', 'app.js'), migrated);
+  git(w.repoRoot, ['add', '-A']);
+  git(w.repoRoot, ['-c', 'user.email=a@b', '-c', 'user.name=fixture', 'commit', '-q', '-m', 'pre-migrated baseline']);
+  const bridgedBaseline = git(w.repoRoot, ['rev-parse', 'HEAD']).trim();
+
+  const u = w.kernel.materialise(w.plan, n(w), bridgedBaseline);
+  w.kernel.acquireLease(u.id, 's1');
+  const { attempt } = w.kernel.runAttempt(u.id, () => 'DONE');
+  const st = w.kernel.expect(u.id);
+
+  assert.equal(attempt.toolInvocations.length, 0, 'reproduces the gap: no tool ever ran');
+  assert.equal(attempt.status, 'completed', 'termination semantics are unchanged by this fix');
+
+  const filesTouched = (st.artifacts[0]!.segments.find((s) => s.name === 'files_touched')!.content as string[]).length;
+  assert.equal(filesTouched, 0, 'the harvested artifact is genuinely empty');
+
+  const nonempty = st.gateResults.find((r) => r.gateRef.startsWith('artifact.nonempty_change'))!;
+  assert.equal(nonempty.verdict, 'fail', 'the new gate catches the empty artifact');
+  const others = st.gateResults.filter((r) => !r.gateRef.startsWith('artifact.nonempty_change'));
+  assert.equal(others.filter((r) => r.verdict !== 'pass').length, 0, 'every other gate is vacuously satisfied — this is the exact gap');
+
+  assert.notEqual(st.status, 'awaiting_approval', 'must not reach approval on a no-op attempt');
+  assert.equal(st.status, 'attempt_failed', 'fails verification in the ordinary way (design 07)');
 });
 
 // ================================================== I. Failure and retry
