@@ -1,5 +1,6 @@
 import type {
-  ExecutorInvocation, ExecutorResult, ExecutorTermination, ModelCallRecord, ModelResponseShape, ToolCallRecord,
+  ExecutorInvocation, ExecutorResult, ExecutorTermination, ModelCallRecord, ModelResponseShape,
+  ResolvedExecutionSpec, ToolCallRecord,
 } from './types.ts';
 import { BudgetExhausted, ModelBroker, ToolBroker } from './broker.ts';
 import type { ModelProvider } from './broker.ts';
@@ -111,6 +112,111 @@ function classifyResponse(parsed: ReturnType<typeof parseActions>): ModelRespons
   if (parsed.malformed > 0) return 'malformed';
   if (parsed.actions.length > 0) return 'tool_call';
   return 'no_action';
+}
+
+// -------------------------------------------------------------- verifier (C2)
+
+/**
+ * The Verifier (design/03 §13, model_judged gates).
+ *
+ * Deliberately NOT `runExecutor`: a verifier issues no tool calls (rule 3:
+ * "the verifier Role has no write capability") and produces exactly one
+ * judgment, not a bounded tool-use loop. Kept in executor.ts rather than
+ * kernel.ts so the actual `deps.models.call` invocation never appears in
+ * kernel.ts — the kernel orchestrates dispatch, it does not itself call a
+ * model (Note 06 §1), exactly the same division `runExecutor` already keeps
+ * for ordinary attempts.
+ */
+
+export interface VerifierDeps {
+  readonly models: ModelBroker;
+  readonly verificationCeiling: number;
+}
+
+export type VerifierVerdict = 'pass' | 'fail' | 'indeterminate' | 'error';
+
+export interface VerifierEvidenceItem {
+  readonly kind: 'finding' | 'location' | 'reproduction' | 'assertion';
+  readonly content: string;
+  readonly location?: string;
+}
+
+export interface VerifierResult {
+  readonly verdict: VerifierVerdict;
+  readonly evidence: readonly VerifierEvidenceItem[];
+  readonly modelInvocations: readonly ModelCallRecord[];
+}
+
+const VERIFIER_EVIDENCE_KINDS = new Set(['finding', 'location', 'reproduction', 'assertion']);
+
+/**
+ * The model's ENTIRE output for a verification call is one JSON object:
+ * `{"verdict": "pass"|"fail"|"indeterminate", "evidence": [{"kind","content","location"?}]}`.
+ * No CALL/DONE convention — there is nothing to call. A response that fails
+ * to parse or fails validation is `indeterminate`, never silently `pass`:
+ * rule 6 (design/03 §13) already treats `indeterminate` as the correct,
+ * reachable destination for "the model didn't give a clean answer."
+ */
+export function runVerifier(
+  attemptId: string, spec: ResolvedExecutionSpec, prompt: string, deps: VerifierDeps,
+): VerifierResult {
+  try {
+    const out = deps.models.call(attemptId, spec, prompt, deps.verificationCeiling);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(out.text);
+    } catch {
+      return {
+        verdict: 'indeterminate',
+        evidence: [{ kind: 'assertion', content: 'verifier response was not valid JSON' }],
+        modelInvocations: deps.models.records as readonly ModelCallRecord[],
+      };
+    }
+    const body = parsed as { verdict?: unknown; evidence?: unknown };
+    if (body.verdict !== 'pass' && body.verdict !== 'fail' && body.verdict !== 'indeterminate') {
+      return {
+        verdict: 'indeterminate',
+        evidence: [{ kind: 'assertion', content: `verifier response had an unrecognised verdict: ${JSON.stringify(body.verdict)}` }],
+        modelInvocations: deps.models.records as readonly ModelCallRecord[],
+      };
+    }
+    const rawEvidence = Array.isArray(body.evidence) ? body.evidence : [];
+    const evidence: VerifierEvidenceItem[] = rawEvidence
+      .filter((e): e is { kind: string; content: string; location?: string } =>
+        typeof e === 'object' && e !== null && VERIFIER_EVIDENCE_KINDS.has((e as { kind?: unknown }).kind as string)
+        && typeof (e as { content?: unknown }).content === 'string')
+      .map((e) => ({ kind: e.kind as VerifierEvidenceItem['kind'], content: e.content, ...(typeof e.location === 'string' ? { location: e.location } : {}) }));
+    return { verdict: body.verdict, evidence, modelInvocations: deps.models.records as readonly ModelCallRecord[] };
+  } catch (e) {
+    return {
+      verdict: 'error',
+      evidence: [{ kind: 'assertion', content: `verifier call failed: ${String(e)}` }],
+      modelInvocations: deps.models.records as readonly ModelCallRecord[],
+    };
+  }
+}
+
+/**
+ * Adapts a VerifierResult into the SAME ExecutorResult shape runExecutor()
+ * returns, so kernel.ts's runAttempt() needs no branching below the point it
+ * chooses which of the two to call — Attempt construction, events, freeze,
+ * and postExecution are byte-identical for a verification unit and an
+ * ordinary one. A verifier issues no tool calls (rule 3), so
+ * toolInvocations is always empty; `verdict:'error'` (an actual call
+ * failure, e.g. budget exhaustion) is the only case NOT mapped to
+ * `'completed'` — a `fail`/`indeterminate` VERDICT is still a successfully
+ * COMPLETED verification attempt; the verdict, not the termination, is what
+ * the outer gate dispatch reads.
+ */
+export function verifierResultToExecutorResult(vr: VerifierResult, attemptId: string): ExecutorResult {
+  return {
+    attemptId,
+    termination: vr.verdict === 'error' ? 'internal_error' : 'completed',
+    toolInvocations: [],
+    modelInvocations: vr.modelInvocations,
+    narrative: '',
+    responseShapes: [],
+  };
 }
 
 const CALL_LINE = /^\s*CALL\s+(\S+)\s+(\S+)\s*(\{.*\})?\s*$/;

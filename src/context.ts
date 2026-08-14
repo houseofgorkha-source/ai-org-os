@@ -1,5 +1,5 @@
 import type {
-  ContextRecipe, ContextManifest, RenderedLayer, WorkUnit, AuthorityTier,
+  ContextRecipe, ContextManifest, RenderedLayer, WorkUnit, AuthorityTier, Artifact,
 } from './types.ts';
 import { estimateTokens, hashOf, nextId, now, sha256 } from './util.ts';
 
@@ -41,6 +41,8 @@ export interface GatherContext {
   readonly priorFailure: string | null;
   readonly readFile: (rel: string) => string | null;
   readonly listFiles: () => readonly string[];
+  /** model_judged gate execution only: the artifact under review, so a verifier layer can render its segments — never set for an ordinary mechanical-change attempt. */
+  readonly reviewArtifact?: Artifact | null;
 }
 
 const AUTHORITY: Record<string, AuthorityTier> = {
@@ -53,6 +55,7 @@ const AUTHORITY: Record<string, AuthorityTier> = {
   runtime_surface: 'policy',
   prior_attempt_evidence: 'contract',
   memory: 'advisory',
+  diff_under_review: 'ground-truth',
 };
 
 export interface CompileResult {

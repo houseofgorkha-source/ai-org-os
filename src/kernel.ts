@@ -3,7 +3,8 @@ import { existsSync, mkdirSync, rmSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type {
   TaskPlan, PlanNode, WorkUnit, WorkUnitStatus, Attempt, AttemptStatus, Artifact,
-  Approval, Escalation, FailureRecord, GateResult, Lease, Money, EffectiveBudget, ContextManifest, DenialRecord,
+  Approval, Escalation, FailureRecord, GateResult, GateDef, GateBinding, Lease, Money, EffectiveBudget, ContextManifest, DenialRecord,
+  ExecutorResult, Evidence,
 } from './types.ts';
 import type { Registry } from './registry.ts';
 import type { InstancePolicy, TierBindingResolver } from './resolve.ts';
@@ -13,7 +14,8 @@ import { ContextCompiler, MemoryStore } from './context.ts';
 import type { GatherContext, LayerSource } from './context.ts';
 import { InMemorySpendLedger, ModelBroker, ToolBroker, mintToken } from './broker.ts';
 import type { ModelProvider } from './broker.ts';
-import { runExecutor } from './executor.ts';
+import { runExecutor, runVerifier, verifierResultToExecutorResult } from './executor.ts';
+import type { VerifierResult } from './executor.ts';
 import { freezeWorkspace, harvest, dedupeArtifact, git } from './harvest.ts';
 import { runGates } from './gates.ts';
 import { quorumMet, validateDispatchApprovals } from './validate.ts';
@@ -66,6 +68,16 @@ export interface UnitState {
   denialsByAttempt: Map<string, DenialRecord[]>;
   /** AttemptIds already folded into `account.spent` — releaseReservation() must never re-add one (Note 06 §7). */
   reconciledAttempts: Set<string>;
+  /**
+   * model_judged (C2) gate execution units ONLY (`unit.expectedOutput ===
+   * 'VerificationReport'`): the artifact under review, pre-redacted to only
+   * the gate's declared `requiresSegments` AND `visibility: 'public'`
+   * (design/03 §13 rule 2) BEFORE it is ever handed to context compilation —
+   * enforced at this exact boundary, not left to layer-source discipline.
+   */
+  reviewArtifact?: Artifact | null;
+  /** model_judged execution units ONLY: the verifier's parsed verdict, set by runAttempt() right after runVerifier(), read by postExecutionInner() to build the VerificationReport instead of harvesting a git diff. */
+  verifierResult?: VerifierResult | null;
 }
 
 export interface Faults {
@@ -352,6 +364,7 @@ export class Kernel {
       priorFailure: st.failures.length ? JSON.stringify(st.failures[st.failures.length - 1]) : null,
       readFile: (rel) => { try { return readFileSync(join(ws, rel), 'utf8'); } catch { return null; } },
       listFiles: () => { try { return git(ws, ['ls-files']).trim().split('\n'); } catch { return []; } },
+      reviewArtifact: st.reviewArtifact ?? null,
     };
     const { rendered, manifest } = this.compiler.compile(st.unit, recipe, gctx);
     st.manifests.push(manifest);
@@ -372,10 +385,26 @@ export class Kernel {
     this.markPlanRunning(st.unit);
     this.emit('attempt.started', [unitId, attemptId], { ordinal, epoch, specHash: spec.hash });
 
-    const result = runExecutor(
-      { attemptId, workUnitId: unitId, executionSpec: spec, renderedContext: rendered, contextManifestRef: manifest.id, capabilityToken: token, workspaceRef: ws, deadline },
-      { tools, models, executionCeiling: st.unit.budget.execution.costCeiling },
-    );
+    // model_judged (C2) gate execution units route through this EXACT same
+    // dispatch — materialise/admit/lease/runAttempt — as any other unit
+    // (design/03 §13 rule 1: "not a privileged path"). The only branch is
+    // WHICH function actually talks to the model: a verifier issues no tool
+    // calls and produces one judgment, not a bounded CALL/DONE loop, so it
+    // uses runVerifier() instead of runExecutor() — everything below this
+    // point (Attempt construction, events, freeze, postExecution) is IDENTICAL
+    // for both, unmodified from before this distinction existed.
+    const isVerification = st.unit.expectedOutput === 'VerificationReport';
+    let result: ExecutorResult;
+    if (isVerification) {
+      const vr = runVerifier(attemptId, spec, rendered, { models, verificationCeiling: st.unit.budget.execution.costCeiling });
+      st.verifierResult = vr;
+      result = verifierResultToExecutorResult(vr, attemptId);
+    } else {
+      result = runExecutor(
+        { attemptId, workUnitId: unitId, executionSpec: spec, renderedContext: rendered, contextManifestRef: manifest.id, capabilityToken: token, workspaceRef: ws, deadline },
+        { tools, models, executionCeiling: st.unit.budget.execution.costCeiling },
+      );
+    }
 
     for (const r of tools.records) this.emit(r.outcome === 'denied' ? 'tool.denied' : 'tool.invoked', [unitId, attemptId], { ...r });
     // responseShape is structured forensic evidence (never raw model text —
@@ -449,14 +478,49 @@ export class Kernel {
       return;
     }
 
-    const h = harvest({
-      workspaceRoot: attempt.workspaceRef!, baselineCommit: st.unit.baselineCommit,
-      unit: st.unit, attemptId: attempt.id, contextManifestRef: attempt.contextManifestRef!,
-    });
-    const { artifact, created } = dedupeArtifact(st.artifacts, h.artifact);
-    if (created) {
-      st.artifacts.push(artifact);
-      this.emit('artifact.constructed', [unitId, artifact.id], { contentHash: artifact.contentHash, filesTouched: h.filesTouched });
+    // model_judged (C2) gate execution units produce a VerificationReport
+    // from the verifier's parsed verdict, never a git-diff harvest — there
+    // is no filesystem mutation to harvest (rule 3: no write capability).
+    // Everything from here on (gate results, blocking/indeterminate/failure
+    // handling, awaiting_approval) is IDENTICAL for both branches; only how
+    // `artifact`/`h` get built differs.
+    let h: { filesTouched: number; insertions: number; deletions: number } | undefined;
+    let artifact: Artifact;
+    if (st.unit.expectedOutput === 'VerificationReport') {
+      const vr = st.verifierResult!;
+      const evidence: Evidence[] = vr.evidence.map((e) => ({
+        kind: e.kind, content: e.content, ...(e.location ? { location: e.location } : {}), visibility: 'public',
+      }));
+      const built: Artifact = {
+        id: nextId('art'), instanceId: this.d.instanceId, type: 'VerificationReport',
+        schemaRef: 'schema://verification_report/1.0.0',
+        contentHash: hashOf({ verdict: vr.verdict, evidence }),
+        createdAt: now(),
+        // Durable, replayable evidence (fixes the discarded-manifest gap):
+        // references the SAME ContextManifest runAttempt() already pushed to
+        // st.manifests for this attempt — never recomputed, never dropped.
+        segments: [{ name: 'evidence', visibility: 'public', content: evidence, hash: hashOf(evidence) }],
+        producedBy: { workUnitId: unitId, attemptId: attempt.id, roleRef: st.unit.executionSpec.roleRef, executionSpecHash: st.unit.executionSpec.hash },
+        inputsHash: hashOf([]), contextManifestRef: attempt.contextManifestRef, status: 'verified',
+      };
+      const deduped = dedupeArtifact(st.artifacts, built);
+      artifact = deduped.artifact;
+      if (deduped.created) {
+        st.artifacts.push(artifact);
+        this.emit('artifact.constructed', [unitId, artifact.id], { contentHash: artifact.contentHash, filesTouched: 0 });
+      }
+    } else {
+      const harvested = harvest({
+        workspaceRoot: attempt.workspaceRef!, baselineCommit: st.unit.baselineCommit,
+        unit: st.unit, attemptId: attempt.id, contextManifestRef: attempt.contextManifestRef!,
+      });
+      h = harvested;
+      const deduped = dedupeArtifact(st.artifacts, harvested.artifact);
+      artifact = deduped.artifact;
+      if (deduped.created) {
+        st.artifacts.push(artifact);
+        this.emit('artifact.constructed', [unitId, artifact.id], { contentHash: artifact.contentHash, filesTouched: harvested.filesTouched });
+      }
     }
     const idx = st.attempts.findIndex((a) => a.id === attempt.id);
     if (idx >= 0) st.attempts[idx] = { ...st.attempts[idx]!, producedArtifact: artifact.id };
@@ -493,10 +557,138 @@ export class Kernel {
       return;
     }
 
+    // C0/C1 all passed. Only now dispatch any model_judged (C2) gates —
+    // design/03 §15's stage ordering ("C2: model-judged review" is the most
+    // expensive stage) means these never run at all if a cheap deterministic
+    // gate already failed. Each executes as its own real dispatch (§13 rule
+    // 1), never a privileged shortcut.
+    for (const { gate, binding } of gr.deferredModelJudged) {
+      const mgr = this.runModelJudgedGate(st, unitId, artifact, gate, binding);
+      st.gateResults.push(mgr);
+      this.emit('gate.result', [unitId, artifact.id], { gateRef: mgr.gateRef, verdict: mgr.verdict });
+      if (mgr.verdict === 'error') {
+        st.status = 'attempt_failed';
+        st.attempts[idx >= 0 ? idx : st.attempts.length - 1] = { ...st.attempts[st.attempts.length - 1]!, status: 'failed' };
+        this.emit('gate.error', [unitId], { gates: [mgr.gateRef] });
+        this.releaseReservation(st);
+        return;
+      }
+      if (mgr.verdict === 'indeterminate' && mgr.blocking) {
+        st.status = 'escalated';
+        this.raiseEscalation(unitId, 'indeterminate', { gate: mgr.gateRef });
+        this.releaseReservation(st);
+        return;
+      }
+      if (mgr.verdict === 'fail' && mgr.blocking) {
+        const failedCriteria = st.unit.acceptanceCriteria
+          .filter((c) => c.check.gateRef.split('@')[0] === mgr.gateRef.split('@')[0])
+          .map((c) => c.id);
+        this.recordFailure(st, attempt, 'verification_failed', [...gr.results, mgr], failedCriteria, h);
+        st.status = 'attempt_failed';
+        this.releaseReservation(st);
+        return;
+      }
+    }
+
     st.artifacts[st.artifacts.findIndex((a) => a.id === artifact.id)] = { ...artifact, status: 'verified' };
     st.status = 'awaiting_approval';
     this.emit('artifact.verified', [unitId, artifact.id], {});
     this.releaseReservation(st);
+  }
+
+  /**
+   * Dispatches one C2 (model_judged) gate (design/03 §13) through the
+   * ORDINARY WorkUnit pipeline — materialise() → admit() → acquireLease() →
+   * runAttempt() — the exact same calls any other unit goes through. No
+   * verifier-specific lifecycle exists: `runAttempt()`/`postExecutionInner()`
+   * each have exactly one branch point (§13 rule 1: "not a privileged path")
+   * that chooses runVerifier() over runExecutor() and a VerificationReport
+   * over a harvested CodeDiff, purely because a verifier's OUTPUT SHAPE
+   * differs — everything else (lease/epoch, reservation/reconciliation,
+   * capability token, context manifest, Attempt record, events) is the
+   * real, shared machinery.
+   *
+   * The artifact under review is redacted to `gate.requiresSegments` ∩
+   * `visibility:'public'` BEFORE it is stored where context compilation can
+   * reach it (rule 2) — enforced at this exact boundary, not left to
+   * whichever layer source happens to be careful.
+   */
+  private runModelJudgedGate(st: UnitState, unitId: string, artifact: Artifact, gate: GateDef, binding: GateBinding): GateResult {
+    const allowed = new Set(gate.requiresSegments);
+    const redactedArtifact: Artifact = {
+      ...artifact,
+      segments: artifact.segments.filter((s) => s.visibility === 'public' && allowed.has(s.name)),
+    };
+
+    const verifierNode: PlanNode = {
+      nodeId: `gate:${gate.id}#${st.unit.id}`,
+      objective: `Independently verify the artifact against: ${gate.passMeans}`,
+      roleRef: gate.executionRoleRef!,
+      klass: 'investigation',
+      expectedOutput: 'VerificationReport',
+      acceptanceCriteria: [], constraints: [], affectedPaths: [],
+      // Verification spend is tracked separately from execution spend (Note
+      // 02 §17.3 / ledger B4) — resolveSpec's costCeiling formula reads
+      // node.budget.execution, so the OUTER unit's `budget.verification.cost`
+      // is deliberately passed through that field for the SYNTHETIC verifier
+      // node only; it never touches the outer unit's own execution budget.
+      budget: { execution: st.unit.budget.verification.cost, verification: 0 },
+      approvalsRequired: [],
+    };
+    // A throwaway, uniquely-keyed plan so this gate dispatch never collides
+    // with — or pollutes the status of — the REAL plan the outer unit
+    // belongs to. materialise()/admit()/runAttempt() don't distinguish a
+    // "real" plan from this one; that IS the point of routing through them.
+    const gatePlan: TaskPlan = {
+      id: `gateplan:${gate.id}`, version: st.unit.id, instanceId: this.d.instanceId,
+      intentRef: st.unit.intentRef, nodes: [verifierNode], edges: [],
+      budgetAggregate: { execution: st.unit.budget.verification.cost, verification: 0 },
+      status: 'approved',
+    };
+
+    const verifierUnit = this.materialise(gatePlan, verifierNode, st.unit.baselineCommit);
+    this.expect(verifierUnit.id).reviewArtifact = redactedArtifact;
+
+    const admitResult = this.admit(verifierUnit.id);
+    if (!admitResult.admitted) {
+      return this.modelJudgedInfraError(gate, binding, artifact, `verifier admission refused: ${admitResult.reason}`);
+    }
+    const lease = this.acquireLease(verifierUnit.id, 'kernel:gate');
+    if (!lease) {
+      return this.modelJudgedInfraError(gate, binding, artifact, 'verifier lease not acquired');
+    }
+
+    this.runAttempt(verifierUnit.id, () => 'unused — model_judged gates never consult the script parameter');
+
+    const vst = this.expect(verifierUnit.id);
+    const vr = vst.verifierResult;
+    if (!vr) return this.modelJudgedInfraError(gate, binding, artifact, 'verifier attempt produced no result');
+    const report = vst.artifacts.find((a) => a.type === 'VerificationReport');
+    const evidence = (report?.segments.find((s) => s.name === 'evidence')?.content as Evidence[] | undefined) ?? [];
+    const cost = vst.attempts[0] ? this.d.ledger.spentFor(vst.attempts[0].id) : 0;
+    // The report is genuinely OWNED by the verifier's own WorkUnit (vst.artifacts,
+    // above) — cross-referenced onto the OUTER unit too, purely for discoverability
+    // from the GateResult a caller actually has in hand (design/03 §13 rule 5).
+    if (report && !st.artifacts.some((a) => a.id === report.id)) st.artifacts.push(report);
+
+    return {
+      id: nextId('gr'), gateRef: `${gate.id}@${gate.version}`,
+      subject: { artifactId: artifact.id, contentHash: artifact.contentHash },
+      decides: [], verdict: vr.verdict, blocking: binding.blocking,
+      decidedAt: now(), durationMs: 0, cost, evidence,
+      verificationArtifactRef: report?.id ?? null,
+    };
+  }
+
+  /** Admission/lease refusal for a gate's own dispatch is infrastructure, not a verdict on the artifact — mirrors the `error` verdict's existing "no attempt consumed" semantics (Note 03 §4). */
+  private modelJudgedInfraError(gate: GateDef, binding: GateBinding, artifact: Artifact, message: string): GateResult {
+    return {
+      id: nextId('gr'), gateRef: `${gate.id}@${gate.version}`,
+      subject: { artifactId: artifact.id, contentHash: artifact.contentHash },
+      decides: [], verdict: 'error', blocking: binding.blocking,
+      decidedAt: now(), durationMs: 0, cost: 0,
+      evidence: [{ kind: 'assertion', content: message, visibility: 'public' }],
+    };
   }
 
   private recordFailure(

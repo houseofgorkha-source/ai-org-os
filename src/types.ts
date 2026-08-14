@@ -94,6 +94,8 @@ export interface GateDef {
   readonly stage: number;
   readonly determinism: boolean;
   readonly auditOnly: boolean;
+  /** model_judged only (design/03 §13's `execution.role_ref`). The Role that executes this gate — registry.ts's verificationRoles() reads this exact field name; a Role named here is a VERIFICATION role and may never appear as a plan node (E1.5/B10). */
+  readonly executionRoleRef?: VersionedRef;
   readonly flake?: { readonly maxRuns: number; readonly quorum: string };
   readonly fixtures: {
     readonly mustPass: readonly GateFixture[];
@@ -490,6 +492,8 @@ export interface GateResult {
   readonly evidence: readonly Evidence[];
   readonly determinismHash?: Hash;
   readonly runs?: readonly GateVerdict[];
+  /** model_judged only (design/03 §13 rule 5): "the produced VerificationReport is an artifact, referenced from the GateResult. The report is the detail; the GateResult is the verdict." */
+  readonly verificationArtifactRef?: ArtifactId | null;
 }
 
 // ------------------------------------------------------------- failure record

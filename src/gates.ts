@@ -148,6 +148,8 @@ export interface RunGatesResult {
   readonly blockingFailure: GateResult | null;
   readonly indeterminate: GateResult | null;
   readonly errors: readonly GateResult[];
+  /** model_judged bindings this call did NOT evaluate (no impl is registered for them — design/03 §13 requires kernel-level WorkUnit dispatch, which this pure function has no access to) but that survived stage short-circuiting and appliesWhen filtering. The caller (kernel.ts) dispatches these separately. */
+  readonly deferredModelJudged: readonly { readonly gate: GateDef; readonly binding: GateBinding }[];
 }
 
 /**
@@ -162,6 +164,7 @@ export function runGates(bindings: readonly GateBinding[], registry: Registry, e
   let blockingFailure: GateResult | null = null;
   let indeterminate: GateResult | null = null;
   const errors: GateResult[] = [];
+  const deferredModelJudged: { gate: GateDef; binding: GateBinding }[] = [];
   let failedStage: number | null = null;
 
   for (const b of ordered) {
@@ -173,13 +176,19 @@ export function runGates(bindings: readonly GateBinding[], registry: Registry, e
       if (!resolveTri(tri, 'applies')) continue;   // unknown ⇒ applies (conservative)
     }
 
+    // model_judged gates execute as a real WorkUnit (design/03 §13), which
+    // this pure, kernel-unaware function cannot dispatch — defer to the
+    // caller. Stage short-circuiting and appliesWhen filtering above still
+    // apply to them exactly like any other gate; only impl-lookup is skipped.
+    if (gate.kind === 'model_judged') { deferredModelJudged.push({ gate, binding: b }); continue; }
+
     const r = runOne(gate, b, env);
     results.push(r);
     if (r.verdict === 'error') { errors.push(r); continue; }
     if (r.verdict === 'indeterminate' && b.blocking) { indeterminate ??= r; failedStage ??= gate.stage; continue; }
     if (r.verdict === 'fail' && b.blocking) { blockingFailure ??= r; failedStage ??= gate.stage; }
   }
-  return { results, blockingFailure, indeterminate, errors };
+  return { results, blockingFailure, indeterminate, errors, deferredModelJudged };
 }
 
 function runOne(gate: GateDef, binding: GateBinding, env: GateEnv): GateResult {

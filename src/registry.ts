@@ -67,10 +67,14 @@ export class Registry {
   registerGate(g: GateDef, approvedBy: string): void {
     if (!approvedBy) throw new RegistryError('gate registration requires human approval');
     if (!g.passMeans) throw new RegistryError(`gate ${g.id}: pass_means is mandatory`);
-    if (g.fixtures.mustFail.length === 0) {
+    // Note 03 §8's must_fail requirement "does not extend to C2 model-judged
+    // gates" (§19.2: "a fixture the verifier rejects this week may pass next
+    // week after a model update" — fixture-testing a model's judgment is
+    // structurally meaningless, not merely inconvenient).
+    if (g.criterionClass !== 'C2' && g.fixtures.mustFail.length === 0) {
       throw new RegistryError(`gate ${g.id}: at least one must_fail fixture is required (Note 03 §8)`);
     }
-    if (g.fixtures.mustPass.length === 0) {
+    if (g.criterionClass !== 'C2' && g.fixtures.mustPass.length === 0) {
       throw new RegistryError(`gate ${g.id}: at least one must_pass fixture is required`);
     }
     for (const src of g.requiresContext) {
@@ -80,6 +84,9 @@ export class Registry {
     }
     if (g.criterionClass === 'C0' && !g.determinism) {
       throw new RegistryError(`gate ${g.id}: C0 gates require determinism`);
+    }
+    if (g.kind === 'model_judged' && !g.executionRoleRef) {
+      throw new RegistryError(`gate ${g.id}: model_judged gates require executionRoleRef (design/03 §13)`);
     }
     const { signature, ...body } = g;
     if (!verifySignature(body, signature)) throw new RegistryError(`gate ${g.id}: invalid signature`);
@@ -110,8 +117,7 @@ export class Registry {
   verificationRoles(): Set<string> {
     const s = new Set<string>();
     for (const g of this.gates.values()) {
-      const r = (g as unknown as { executionRoleRef?: string }).executionRoleRef;
-      if (r) s.add(parseRef(r).id);
+      if (g.executionRoleRef) s.add(parseRef(g.executionRoleRef).id);
     }
     return s;
   }
