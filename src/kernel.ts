@@ -654,7 +654,13 @@ export class Kernel {
     if (st.reserved <= 0) return;
     this.account.reserved -= st.reserved;
     const actual = st.attempts.reduce((a, at) => a + this.d.ledger.spentFor(at.id), 0);
-    this.account.spent = actual;
+    // Note 06 §7: `instance_spent += actual`. The account is instance-scoped
+    // (its cap is `perDayCap`), so a unit's terminal reconciliation ADDS its
+    // spend; assigning would erase every prior unit's, and `admit()`'s
+    // headroom check reads this field — under-counting there is an overspend,
+    // the one direction `fail_closed` forbids. Each unit contributes exactly
+    // once: the `st.reserved <= 0` guard above plus the zeroing below.
+    this.account.spent += actual;
     this.emit('budget.released', [st.unit.id], { released: st.reserved, actual });
     st.reserved = 0;
   }

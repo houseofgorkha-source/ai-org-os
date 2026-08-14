@@ -396,6 +396,48 @@ test('T-L5 fail_closed: the budget stops work rather than extending', () => {
   assert.equal(w.ledger.spentFor(a.attempt.id), 0);
 });
 
+test('T-L6 instance spend accumulates across units and constrains admission', () => {
+  // Note 06 §7's TERMINAL row is `instance_spent += actual`, and the account
+  // is instance-scoped (`perDayCap`). Every pre-existing budget test runs a
+  // single unit, where `=` and `+=` are indistinguishable; two units are the
+  // smallest world that can tell them apart. Found by the first real 2-node
+  // run, not by the suite.
+  const w = makeWorld({ script: FIXING_SCRIPT });
+  const base = w.plan.nodes[0]!;
+  const plan = { ...w.plan, nodes: [base, { ...base, nodeId: 'n2' }, { ...base, nodeId: 'n3' }] };
+
+  const u1 = w.kernel.materialise(plan, plan.nodes[0]!, w.baseline);
+  w.kernel.acquireLease(u1.id, 's1');
+  const a1 = w.kernel.runAttempt(u1.id, FIXING_SCRIPT);
+  const x = w.ledger.spentFor(a1.attempt.id);
+  assert.ok(x > 0, 'unit 1 spent something real');
+  assert.equal(w.kernel.account.reserved, 0, 'unit 1 reservation released at terminal');
+  assert.equal(w.kernel.account.spent, x, 'after one unit, instance spend is that unit\'s spend');
+
+  const u2 = w.kernel.materialise(plan, plan.nodes[1]!, w.baseline);
+  w.kernel.acquireLease(u2.id, 's2');
+  const a2 = w.kernel.runAttempt(u2.id, FIXING_SCRIPT);
+  const y = w.ledger.spentFor(a2.attempt.id);
+  assert.ok(y > 0, 'unit 2 spent something real');
+  assert.equal(w.kernel.account.reserved, 0, 'unit 2 reservation released at terminal');
+  assert.equal(w.kernel.account.spent, x + y, 'unit 2 ADDS to the instance total; it does not replace it');
+
+  // The accumulated total must actually gate admission, not merely be
+  // reported. `dayCap` is set strictly between (ceiling + y) and
+  // (ceiling + x + y): unit 3 is refusable only if BOTH units' spend is
+  // counted. Under the overwriting bug the account would read `y` and unit 3
+  // would be admitted — an overspend against the day cap.
+  const u3 = w.kernel.materialise(plan, plan.nodes[2]!, w.baseline);
+  const ceiling = u3.budget.execution.costCeiling;
+  (w.kernel.account as { dayCap: number }).dayCap = ceiling + y + x / 2;
+  assert.ok(w.kernel.account.reserved + y + ceiling <= w.kernel.account.dayCap,
+    'control: unit 2\'s spend alone leaves headroom for unit 3');
+  const r = w.kernel.admit(u3.id);
+  assert.equal(r.admitted, false, 'unit 3 must be refused once BOTH units\' spend is counted');
+  assert.equal(r.reason, 'instance_budget_headroom');
+  assert.equal(w.kernel.expect(u3.id).status, 'validated', 'a refused admission is not a transition');
+});
+
 // ==================================================== M. Instrumentation
 
 test('T-M1..M6 all tier-1 measures are non-null from unit zero', () => {
